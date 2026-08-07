@@ -1,0 +1,104 @@
+import { describe, expect, it } from 'vitest';
+import { parseEnv, PROTOCOL_FEE_BPS_MVP } from './env';
+
+function encodeSegment(value: unknown): string {
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+
+function fakeJwt(payload: Record<string, unknown>): string {
+  return `${encodeSegment({ alg: 'HS256', typ: 'JWT' })}.${encodeSegment(payload)}.signature`;
+}
+
+function validEnv(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    NODE_ENV: 'test',
+    PORT: '3000',
+    HOST: '0.0.0.0',
+    DATABASE_URL: 'postgresql://user:password@localhost:5432/postgres',
+    SUPABASE_URL: 'https://example.supabase.co',
+    SUPABASE_SERVICE_ROLE_KEY: fakeJwt({ role: 'service_role' }),
+    STELLAR_NETWORK: 'testnet',
+    STELLAR_RPC_URL: 'https://soroban-testnet.stellar.org',
+    STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+    FACTORY_CONTRACT_ID: '',
+    USDC_CONTRACT_ID: '',
+    TREASURY_ADDRESS: '',
+    PROTOCOL_FEE_BPS: String(PROTOCOL_FEE_BPS_MVP),
+    WALLET_NONCE_SECRET: 'a'.repeat(32),
+    ALLOW_MAINNET: 'false',
+    CORS_ALLOWED_ORIGINS: 'http://localhost:5173',
+    ...overrides,
+  };
+}
+
+describe('parseEnv', () => {
+  it('accepts a valid testnet environment', () => {
+    const env = parseEnv(validEnv());
+    expect(env.STELLAR_NETWORK).toBe('testnet');
+    expect(env.PORT).toBe(3000);
+  });
+
+  it('coerces numeric values from strings', () => {
+    const env = parseEnv(validEnv({ PORT: '8080', PROTOCOL_FEE_BPS: '50' }));
+    expect(env.PORT).toBe(8080);
+  });
+
+  it('rejects a non-postgres DATABASE_URL', () => {
+    expect(() => parseEnv(validEnv({ DATABASE_URL: 'mysql://localhost/db' }))).toThrow(
+      /Invalid server environment configuration/,
+    );
+  });
+
+  it('rejects a missing service role key', () => {
+    const env = validEnv();
+    delete env['SUPABASE_SERVICE_ROLE_KEY'];
+    expect(() => parseEnv(env)).toThrow(/Invalid server environment configuration/);
+  });
+
+  it('rejects an anon key in the service-role variable', () => {
+    const anonKey = fakeJwt({ role: 'anon' });
+    expect(() => parseEnv(validEnv({ SUPABASE_SERVICE_ROLE_KEY: anonKey }))).toThrow(
+      /service_role token/,
+    );
+  });
+
+  it('rejects a protocol fee that differs from the on-chain fee', () => {
+    expect(() => parseEnv(validEnv({ PROTOCOL_FEE_BPS: '100' }))).toThrow(/must be 50/);
+  });
+
+  it('rejects a short wallet nonce secret', () => {
+    expect(() => parseEnv(validEnv({ WALLET_NONCE_SECRET: 'too-short' }))).toThrow(
+      /Invalid server environment configuration/,
+    );
+  });
+
+  it('refuses mainnet without explicit opt-in', () => {
+    expect(() => parseEnv(validEnv({ STELLAR_NETWORK: 'mainnet' }))).toThrow(/ALLOW_MAINNET/);
+  });
+
+  it('allows mainnet only with explicit opt-in', () => {
+    const env = parseEnv(validEnv({ STELLAR_NETWORK: 'mainnet', ALLOW_MAINNET: 'true' }));
+    expect(env.STELLAR_NETWORK).toBe('mainnet');
+  });
+
+  it('accepts a well-formed treasury account address', () => {
+    const treasury = `G${'A'.repeat(55)}`;
+    expect(() => parseEnv(validEnv({ TREASURY_ADDRESS: treasury }))).not.toThrow();
+  });
+
+  it('rejects a malformed treasury address', () => {
+    expect(() => parseEnv(validEnv({ TREASURY_ADDRESS: 'not-an-address' }))).toThrow(
+      /Invalid server environment configuration/,
+    );
+  });
+
+  it('does not leak the service role key in error messages', () => {
+    const secretKey = fakeJwt({ role: 'anon', marker: 'super-secret-xyz' });
+    try {
+      parseEnv(validEnv({ SUPABASE_SERVICE_ROLE_KEY: secretKey }));
+      expect.unreachable('expected parseEnv to throw');
+    } catch (error) {
+      expect(String(error)).not.toContain('super-secret-xyz');
+    }
+  });
+});

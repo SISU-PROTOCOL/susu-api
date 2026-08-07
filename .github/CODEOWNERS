@@ -1,0 +1,17 @@
+# CODEOWNERS
+#
+# Owners are automatically requested for review.
+# Replace placeholder handles with real GitHub usernames before enabling branch protection.
+
+*                                   @geeekyfocus
+
+# Security-critical server code.
+/src/lib/env.ts                     @geeekyfocus
+/src/lib/logger.ts                  @geeekyfocus
+/src/db/                            @geeekyfocus
+/drizzle/                           @geeekyfocus
+/tests/db/                          @geeekyfocus
+/scripts/run-db-security-tests.sh   @geeekyfocus
+/SECURITY.md                        @geeekyfocus
+/.github/workflows/                 @geeekyfocus
+/.env.example                       @geeekyfocus

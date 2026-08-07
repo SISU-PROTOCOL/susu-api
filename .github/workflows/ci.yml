@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: Format, Lint, Typecheck, Test, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  db-security:
+    name: Database Security Guards
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: susu_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/susu_test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify the guards pass on a clean database
+        run: bash scripts/run-db-security-tests.sh
+
+      - name: Verify the guards actually catch a table without RLS
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            'CREATE TABLE public.guard_self_test (id integer primary key);'
+          if bash scripts/run-db-security-tests.sh; then
+            echo "::error::The RLS guard failed to detect a table without RLS enabled."
+            exit 1
+          fi
+          echo "Guard correctly detected the unprotected table."
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP TABLE public.guard_self_test;'
+
+      - name: Verify the guards catch an unconditionally permissive policy
+        run: |
+          set -euo pipefail
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE public.guard_policy_test (id integer primary key);
+          ALTER TABLE public.guard_policy_test ENABLE ROW LEVEL SECURITY;
+          CREATE POLICY allow_everything ON public.guard_policy_test
+            FOR SELECT USING (true);
+          SQL
+          if bash scripts/run-db-security-tests.sh; then
+            echo "::error::The guard failed to detect an unconditionally permissive policy."
+            exit 1
+          fi
+          echo "Guard correctly detected the permissive policy."
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP TABLE public.guard_policy_test;'
