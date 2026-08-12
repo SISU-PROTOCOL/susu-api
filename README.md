@@ -1,6 +1,6 @@
 # Susu Protocol — API
 
-[![CI](https://github.com/Susu-Protocol/susu-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Susu-Protocol/susu-api/actions/workflows/ci.yml)
+[![CI](https://github.com/SISU-PROTOCOL/susu-api/actions/workflows/ci.yml/badge.svg)](https://github.com/SISU-PROTOCOL/susu-api/actions/workflows/ci.yml)
 
 Backend API for **Susu Protocol** — a non-custodial rotating savings protocol on Stellar.
 
