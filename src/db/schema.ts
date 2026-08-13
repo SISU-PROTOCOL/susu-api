@@ -1,9 +1,27 @@
 /**
- * Database schema.
+ * Database schema owned by this service.
  *
- * Phase 0: intentionally empty. Tables are introduced in Phase 4 (profiles and
- * auth-adjacent data) and Phase 5 (groups, members, rounds, contributions,
- * payouts, transactions, notifications, invites, indexed events, audit logs).
+ * Phase 0 onward: API-owned tables (profiles, wallet links, invite links,
+ * notifications) are declared here and migrated through `drizzle-kit`.
+ *
+ * WHY THE CHAIN-DERIVED TABLES ARE NOT DECLARED HERE
+ * `groups`, `group_members`, `contributions`, `payouts`, `protocol_fees` and
+ * `decoded_events` belong to the indexer: `susu-indexer` owns their DDL, in
+ * `supabase/migrations/20260816000000_chain_derived.sql`. This service only
+ * reads them.
+ *
+ * Declaring them here as well would give `drizzle-kit generate` the impression
+ * that this repository owns them, and it would emit `create table` and
+ * `alter table` statements for tables another service migrates. Two
+ * repositories generating migrations for one table is how a schema drifts, so
+ * the ownership boundary is drawn in the one place that enforces it: the
+ * generator's schema file.
+ *
+ * They are read through explicit SQL in `src/db/groups.ts`, which selects each
+ * amount with a `::text` cast. That is not belt-and-braces: the indexer's
+ * migration documents that a `numeric` read can reach JavaScript as a JSON
+ * number, and `src/lib/base-units.ts` explains why that must be a loud failure
+ * rather than a round number.
  *
  * MANDATORY REQUIREMENTS FOR EVERY TABLE ADDED HERE
  *
@@ -22,16 +40,6 @@
  *    safe `search_path`, fully qualified relations, restricted EXECUTE, and review.
  * 7. pgTAP/Supabase security tests cover anonymous denial, ownership and group
  *    boundaries, denied CRUD, Storage policies, and server-only tables.
- *
- * Unique constraints required by the specification:
- *   - groups.contract_address            unique
- *   - group_members (group, wallet)      unique
- *   - group_rounds  (group, round)       unique
- *   - contributions (group, round, member) unique, and tx hash unique
- *   - payouts       (group, round)       unique, and tx hash unique
- *   - transactions.hash                  unique
- *   - invite_links.code                  unique
- *   - indexed_events event identity      unique
  */
 
 export {};
