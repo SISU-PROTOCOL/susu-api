@@ -4,7 +4,22 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import { getEnv } from './lib/env';
 import { buildLoggerOptions } from './lib/logger';
+import { createGroupReadModel, type GroupReadModel } from './db/groups';
+import { getDb } from './db/client';
 import { healthRoutes } from './routes/health';
+import { groupRoutes } from './routes/groups';
+
+/**
+ * Dependencies a caller may substitute.
+ *
+ * Both are injectable so tests can exercise the routes — including the failure
+ * paths, which are the ones worth testing — without a database. Production
+ * passes neither and gets the real implementations.
+ */
+export type BuildServerOptions = {
+  readModel?: GroupReadModel;
+  probeDatabase?: () => Promise<void>;
+};
 
 /**
  * Builds the API server.
@@ -19,7 +34,7 @@ import { healthRoutes } from './routes/health';
  * This service is an application layer only. It never holds custody and never
  * decides balances, payout recipients, eligibility, or financial authorization.
  */
-export async function buildServer(): Promise<FastifyInstance> {
+export async function buildServer(options: BuildServerOptions = {}): Promise<FastifyInstance> {
   const env = getEnv();
 
   const app = Fastify({
@@ -48,7 +63,14 @@ export async function buildServer(): Promise<FastifyInstance> {
     timeWindow: '1 minute',
   });
 
-  await app.register(healthRoutes);
+  await app.register(healthRoutes, { probeDatabase: options.probeDatabase });
+
+  // Versioned application surface. `getDb()` builds a connection pool lazily, so
+  // constructing the read model opens no connection until the first query.
+  await app.register(groupRoutes, {
+    prefix: '/api/v1',
+    readModel: options.readModel ?? createGroupReadModel(getDb()),
+  });
 
   app.setNotFoundHandler(async (_request, reply) => {
     await reply.code(404).send({ error: 'not_found' });

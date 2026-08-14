@@ -1,37 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import { configureTestEnv } from './support/fixtures';
 
-function encodeSegment(value: unknown): string {
-  return Buffer.from(JSON.stringify(value)).toString('base64url');
-}
-
-function fakeJwt(payload: Record<string, unknown>): string {
-  return `${encodeSegment({ alg: 'HS256', typ: 'JWT' })}.${encodeSegment(payload)}.signature`;
-}
-
-// Configure the environment before the server module reads it.
-process.env['NODE_ENV'] = 'test';
-process.env['PORT'] = '3000';
-process.env['HOST'] = '0.0.0.0';
-process.env['DATABASE_URL'] = 'postgresql://user:password@localhost:5432/postgres';
-process.env['SUPABASE_URL'] = 'https://example.supabase.co';
-process.env['SUPABASE_SERVICE_ROLE_KEY'] = fakeJwt({ role: 'service_role' });
-process.env['STELLAR_NETWORK'] = 'testnet';
-process.env['STELLAR_RPC_URL'] = 'https://soroban-testnet.stellar.org';
-process.env['STELLAR_NETWORK_PASSPHRASE'] = 'Test SDF Network ; September 2015';
-process.env['FACTORY_CONTRACT_ID'] = '';
-process.env['USDC_CONTRACT_ID'] = '';
-process.env['TREASURY_ADDRESS'] = '';
-process.env['PROTOCOL_FEE_BPS'] = '50';
-process.env['WALLET_NONCE_SECRET'] = 'a'.repeat(32);
-process.env['ALLOW_MAINNET'] = 'false';
-process.env['CORS_ALLOWED_ORIGINS'] = 'http://localhost:5173';
+configureTestEnv();
 
 let app: FastifyInstance;
 
 beforeAll(async () => {
   const { buildServer } = await import('../src/server');
-  app = await buildServer();
+  // The readiness probe is injected so the suite does not need a database. The
+  // real probe's failure path is covered explicitly below.
+  app = await buildServer({ probeDatabase: async () => {} });
 });
 
 afterAll(async () => {
@@ -45,12 +24,38 @@ describe('health routes', () => {
     expect(response.json()).toEqual({ status: 'ok' });
   });
 
-  it('reports readiness without claiming unverified checks', async () => {
+  it('reports readiness with each check named', async () => {
     const response = await app.inject({ method: 'GET', url: '/ready' });
     expect(response.statusCode).toBe(200);
-    const body = response.json() as { status: string; checks: Record<string, string> };
-    expect(body.status).toBe('ready');
-    expect(body.checks['config']).toBe('ok');
+    expect(response.json()).toEqual({
+      status: 'ready',
+      checks: { config: 'ok', database: 'ok' },
+    });
+  });
+});
+
+describe('readiness when the database is unreachable', () => {
+  it('reports unavailable without leaking the failure', async () => {
+    const { buildServer } = await import('../src/server');
+    const failing = await buildServer({
+      probeDatabase: async () => {
+        throw new Error('connection refused to postgresql://user:password@localhost:5432');
+      },
+    });
+
+    try {
+      const response = await failing.inject({ method: 'GET', url: '/ready' });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        status: 'unavailable',
+        checks: { config: 'ok', database: 'unavailable' },
+      });
+      // The connection string must not reach the client, even inside an error.
+      expect(response.body).not.toContain('password');
+    } finally {
+      await failing.close();
+    }
   });
 });
 
