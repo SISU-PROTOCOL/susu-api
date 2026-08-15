@@ -1,6 +1,7 @@
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import { getEnv } from '../lib/env';
+import { resolveSsl, withoutSslModeParams } from './ssl';
 import * as schema from './schema';
 
 /**
@@ -21,7 +22,11 @@ export function getPool(): Pool {
   if (pool === undefined) {
     const env = getEnv();
     pool = new Pool({
-      connectionString: env.DATABASE_URL,
+      // TLS is configured here rather than left to the connection string; see
+      // `src/db/ssl.ts` for why `pg`'s default makes every query time out against
+      // a hosted database, and what `DATABASE_SSL_CA` changes.
+      connectionString: withoutSslModeParams(env.DATABASE_URL),
+      ssl: resolveSsl(env.DATABASE_URL, env.DATABASE_SSL_CA),
       max: 10,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
