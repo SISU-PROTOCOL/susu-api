@@ -100,6 +100,30 @@ The chain-derived tables are covered by the same guards even though this service
 create them: they have RLS enabled with no policies, and `anon` and `authenticated` hold no
 privileges on them.
 
+## Connecting to a hosted database
+
+`pg` does not enable TLS by default, and hosted Postgres — Supabase included — refuses an
+unencrypted connection. Left alone, every query fails with `Connection terminated due to
+connection timeout`, which reads as a network fault rather than a missing TLS handshake.
+The connection therefore configures TLS explicitly (`src/db/ssl.ts`) instead of leaving it to
+the connection string.
+
+Two consequences worth knowing:
+
+- **Do not append `sslmode=` to `DATABASE_URL`.** Modern `pg` reads `sslmode=require` as
+  `verify-full`, which fails against the Supabase pooler's self-signed chain. The parameter is
+  ignored on purpose so there is one source of truth for TLS.
+- **The server is encrypted but not authenticated by default.** Supabase's pooler presents a
+  chain rooted in its own CA, which Node's trust store does not carry. Setting
+  `DATABASE_SSL_CA` to Supabase's CA bundle (Project Settings → Database → SSL configuration)
+  switches verification on. Until then, an attacker positioned between this service and the
+  database could terminate the TLS session undetected.
+
+The Supabase direct host (`db.<ref>.supabase.co`) publishes only an IPv6 address, so a network
+without IPv6 must use the pooler:
+`postgresql://postgres.<ref>:<password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres`.
+Local development against the Supabase CLI stack needs no TLS and is detected automatically.
+
 ## Development
 
 Requires Node ≥ 22 and pnpm.

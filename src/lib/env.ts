@@ -26,6 +26,10 @@ export const envSchema = z.object({
       (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
       'must be a postgres:// or postgresql:// connection string',
     ),
+  // PEM contents of the database server's CA. Optional: without it the
+  // connection is encrypted but the server is not authenticated. Supplying
+  // Supabase's CA bundle turns verification on. Server-only, like everything here.
+  DATABASE_SSL_CA: z.string().optional(),
   SUPABASE_URL: z.string().url(),
   // Server-only. Never exposed to the browser.
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
