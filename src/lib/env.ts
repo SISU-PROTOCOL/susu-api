@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveSslPolicy } from '../db/ssl';
 
 /**
  * Server-side environment validation.
@@ -26,10 +27,20 @@ export const envSchema = z.object({
       (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
       'must be a postgres:// or postgresql:// connection string',
     ),
-  // PEM contents of the database server's CA. Optional: without it the
-  // connection is encrypted but the server is not authenticated. Supplying
-  // Supabase's CA bundle turns verification on. Server-only, like everything here.
+  // PEM contents of the database server's CA. Optional, but see
+  // DATABASE_SSL_ALLOW_UNVERIFIED below: without it, or that flag, the API
+  // refuses to start rather than connecting to a server it cannot authenticate.
+  // Supabase publishes its CA at Project Settings -> Database -> SSL
+  // configuration. Server-only, like everything here.
   DATABASE_SSL_CA: z.string().optional(),
+  // Explicit acknowledgement that the database server will not be authenticated.
+  // Named for what it permits: setting it accepts a machine-in-the-middle risk,
+  // it does not enable a feature. See `src/db/ssl.ts` for why Supabase cannot be
+  // verified with the default trust store.
+  DATABASE_SSL_ALLOW_UNVERIFIED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   SUPABASE_URL: z.string().url(),
   // Server-only. Never exposed to the browser.
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
@@ -101,6 +112,19 @@ function assertSecurityInvariants(env: Env): void {
       'STELLAR_NETWORK is mainnet but ALLOW_MAINNET is not "true". ' +
         'Mainnet is out of scope until the Mainnet readiness gate is passed with explicit approval.',
     );
+  }
+
+  // Refuse a database connection that would be encrypted but unauthenticated.
+  // Checked here, at startup, rather than when the first query runs: a pool that
+  // fails mid-request turns a configuration mistake into an outage, and this is a
+  // decision that must be made deliberately rather than defaulted into.
+  const tls = resolveSslPolicy({
+    connectionString: env.DATABASE_URL,
+    ca: env.DATABASE_SSL_CA,
+    allowUnverified: env.DATABASE_SSL_ALLOW_UNVERIFIED,
+  });
+  if (!tls.ok) {
+    throw new Error(`Unsafe database TLS configuration — ${tls.reason}. ${tls.remedy}`);
   }
 }
 
