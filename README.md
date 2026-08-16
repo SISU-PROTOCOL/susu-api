@@ -108,16 +108,30 @@ connection timeout`, which reads as a network fault rather than a missing TLS ha
 The connection therefore configures TLS explicitly (`src/db/ssl.ts`) instead of leaving it to
 the connection string.
 
-Two consequences worth knowing:
+Supabase serves its pooler from a **private certificate authority**, not a public one:
 
-- **Do not append `sslmode=` to `DATABASE_URL`.** Modern `pg` reads `sslmode=require` as
-  `verify-full`, which fails against the Supabase pooler's self-signed chain. The parameter is
-  ignored on purpose so there is one source of truth for TLS.
-- **The server is encrypted but not authenticated by default.** Supabase's pooler presents a
-  chain rooted in its own CA, which Node's trust store does not carry. Setting
-  `DATABASE_SSL_CA` to Supabase's CA bundle (Project Settings → Database → SSL configuration)
-  switches verification on. Until then, an attacker positioned between this service and the
-  database could terminate the TLS session undetected.
+```
+CN=*.pooler.supabase.com
+CN=Supabase Intermediate 2021 CA
+CN=Supabase Root 2021 CA        <- self-signed
+```
+
+Node's trust store will never carry that root, so the connection can be encrypted without the
+server being authenticated. Three consequences:
+
+- **The API refuses to start** against a remote database with neither a CA nor an explicit
+  acknowledgement. Encrypted-and-unverified is indistinguishable from encrypted-and-verified at
+  runtime, so a deployment that quietly fell back to the weaker one would go unnoticed.
+- **Take `DATABASE_SSL_CA` from the dashboard**, at Project Settings → Database → SSL
+  configuration. Do not scrape it from the connection: a CA captured over the channel it is
+  meant to secure is trust-on-first-use, and an attacker present at capture time would supply
+  their own root to be pinned permanently.
+- **`DATABASE_SSL_ALLOW_UNVERIFIED=true` accepts the gap deliberately.** Until a CA is supplied,
+  anything between this service and the database could terminate the TLS session undetected.
+
+Do **not** append `sslmode=` to `DATABASE_URL`. Modern `pg` reads `sslmode=require` as
+`verify-full`, which fails against the pooler's chain; the parameter is ignored on purpose so
+there is one source of truth for TLS.
 
 The Supabase direct host (`db.<ref>.supabase.co`) publishes only an IPv6 address, so a network
 without IPv6 must use the pooler:

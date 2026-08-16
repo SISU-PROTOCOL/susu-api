@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { connectionHost, resolveSsl, withoutSslModeParams } from './ssl';
+import { connectionHost, resolveSslPolicy, withoutSslModeParams } from './ssl';
 
 const HOSTED = 'postgresql://postgres.abc:pw@aws-1-eu-west-1.pooler.supabase.com:5432/postgres';
 const LOCAL = 'postgresql://postgres:postgres@localhost:54322/postgres';
 const LOOPBACK = 'postgresql://postgres:postgres@127.0.0.1:5432/postgres';
+const CA = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
+
+/** The common case: a remote host with no CA and no explicit acknowledgement. */
+const bare = (overrides: Partial<Parameters<typeof resolveSslPolicy>[0]> = {}) =>
+  resolveSslPolicy({ connectionString: HOSTED, allowUnverified: false, ...overrides });
 
 describe('connectionHost', () => {
   it('extracts the host', () => {
@@ -42,37 +47,72 @@ describe('withoutSslModeParams', () => {
   });
 });
 
-describe('resolveSsl', () => {
-  it('encrypts a hosted connection', () => {
-    // Without this every query against Supabase times out, which reads as a
-    // network fault rather than a missing TLS handshake.
-    expect(resolveSsl(HOSTED)).toEqual({ rejectUnauthorized: false });
+describe('resolveSslPolicy — refusing an unauthenticated connection', () => {
+  it('refuses a remote host with no CA and no acknowledgement', () => {
+    // The regression this whole policy exists for. Encrypted and
+    // unauthenticated looks identical to encrypted and verified at runtime, so a
+    // deployment that fell back to the weaker one would never be noticed.
+    const result = bare();
+    expect(result.ok).toBe(false);
   });
 
-  it('does not require TLS for a local database', () => {
-    expect(resolveSsl(LOCAL)).toBe(false);
-    expect(resolveSsl(LOOPBACK)).toBe(false);
+  it('explains both remedies rather than just refusing', () => {
+    // A refusal an operator cannot act on gets worked around, not fixed.
+    const result = bare();
+    if (result.ok) throw new Error('expected the policy to refuse');
+    expect(result.remedy).toContain('DATABASE_SSL_CA');
+    expect(result.remedy).toContain('DATABASE_SSL_ALLOW_UNVERIFIED');
+    expect(result.reason).toContain('aws-1-eu-west-1.pooler.supabase.com');
   });
 
+  it('refuses when the host cannot be parsed', () => {
+    // Fails closed: an unparseable URL must not be assumed local, which would
+    // send credentials in clear text to whatever pg ends up connecting to.
+    const result = resolveSslPolicy({ connectionString: 'nonsense', allowUnverified: false });
+    expect(result.ok).toBe(false);
+  });
+
+  it('accepts an unverified remote connection only once acknowledged', () => {
+    const result = bare({ allowUnverified: true });
+    expect(result).toEqual({ ok: true, ssl: { rejectUnauthorized: false } });
+  });
+});
+
+describe('resolveSslPolicy — verified and local connections', () => {
   it('verifies the server when a CA is supplied', () => {
-    const ca = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
-    expect(resolveSsl(HOSTED, ca)).toEqual({ rejectUnauthorized: true, ca });
+    expect(bare({ ca: CA })).toEqual({
+      ok: true,
+      ssl: { rejectUnauthorized: true, ca: CA },
+    });
+  });
+
+  it('verifies without needing the acknowledgement flag', () => {
+    // A CA is the fix; the flag is only for accepting the gap.
+    expect(bare({ ca: CA, allowUnverified: false }).ok).toBe(true);
   });
 
   it('ignores a blank CA rather than treating it as verification', () => {
-    // A variable that exists but is empty must not silently disable verification
-    // by making the CA `undefined`-like but "set".
-    expect(resolveSsl(HOSTED, '   ')).toEqual({ rejectUnauthorized: false });
-    expect(resolveSsl(HOSTED, '')).toEqual({ rejectUnauthorized: false });
+    // A variable that exists but is empty must not silently count as configured,
+    // which would either disable verification or fail confusingly.
+    expect(bare({ ca: '   ' }).ok).toBe(false);
+    expect(bare({ ca: '' }).ok).toBe(false);
+  });
+
+  it('does not require TLS for a local database', () => {
+    // The Supabase CLI stack and containers speak plain TCP; requiring TLS there
+    // would break local development for no gain.
+    for (const connectionString of [LOCAL, LOOPBACK]) {
+      expect(resolveSslPolicy({ connectionString, allowUnverified: false })).toEqual({
+        ok: true,
+        ssl: false,
+      });
+    }
   });
 
   it('does not verify a local database even when a CA is supplied', () => {
-    expect(resolveSsl(LOCAL, 'ca')).toBe(false);
-  });
-
-  it('encrypts when the host cannot be parsed', () => {
-    // Fails safe: an unparseable URL must not be assumed local, which would send
-    // credentials in clear text to whatever pg ends up connecting to.
-    expect(resolveSsl('nonsense')).toEqual({ rejectUnauthorized: false });
+    expect(resolveSslPolicy({ connectionString: LOCAL, ca: CA, allowUnverified: false })).toEqual({
+      ok: true,
+      ssl: false,
+    });
   });
 });

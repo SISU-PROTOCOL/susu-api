@@ -38,6 +38,46 @@ describe('parseEnv', () => {
     expect(env.PORT).toBe(3000);
   });
 
+  it('accepts a hosted database once the CA is supplied', () => {
+    const env = parseEnv(
+      validEnv({
+        DATABASE_URL: 'postgresql://u:p@aws-1-eu-west-1.pooler.supabase.com:5432/postgres',
+        DATABASE_SSL_CA: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----',
+      }),
+    );
+    expect(env.DATABASE_SSL_ALLOW_UNVERIFIED).toBe(false);
+  });
+
+  it('refuses to start against a hosted database it cannot authenticate', () => {
+    // The deployment trap. Without this, the API connects to Supabase with TLS
+    // configured but the server unverified, which behaves identically to a
+    // verified connection and would go unnoticed for the life of the project.
+    expect(() =>
+      parseEnv(
+        validEnv({
+          DATABASE_URL: 'postgresql://u:p@aws-1-eu-west-1.pooler.supabase.com:5432/postgres',
+        }),
+      ),
+    ).toThrow(/Unsafe database TLS configuration/);
+  });
+
+  it('starts against a hosted database once the risk is acknowledged', () => {
+    const env = parseEnv(
+      validEnv({
+        DATABASE_URL: 'postgresql://u:p@aws-1-eu-west-1.pooler.supabase.com:5432/postgres',
+        DATABASE_SSL_ALLOW_UNVERIFIED: 'true',
+      }),
+    );
+    expect(env.DATABASE_SSL_ALLOW_UNVERIFIED).toBe(true);
+  });
+
+  it('does not require the acknowledgement for a local database', () => {
+    // Local development must stay frictionless, or the flag becomes noise that
+    // gets set everywhere and stops meaning anything.
+    const env = parseEnv(validEnv({ DATABASE_URL: 'postgresql://u:p@localhost:54322/postgres' }));
+    expect(env.DATABASE_SSL_ALLOW_UNVERIFIED).toBe(false);
+  });
+
   it('coerces numeric values from strings', () => {
     const env = parseEnv(validEnv({ PORT: '8080', PROTOCOL_FEE_BPS: '50' }));
     expect(env.PORT).toBe(8080);
