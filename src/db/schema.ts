@@ -1,8 +1,14 @@
 /**
  * Database schema owned by this service.
  *
- * Phase 0 onward: API-owned tables (profiles, wallet links, invite links,
- * notifications) are declared here and migrated through `drizzle-kit`.
+ * Phase 4 adds the application tables. The document's phase list places
+ * "Supabase Auth + Postgres + RLS + profiles" together because the three are one
+ * decision: a table without RLS is a table the browser can read, so the profile
+ * table and its policies ship in the same migration.
+ *
+ * Only `profiles` is declared here. `wallet_links`, `invite_links` and
+ * `notifications` belong to later phases ("Backend + invites"), and declaring
+ * them now would mean shipping tables nothing writes to.
  *
  * WHY THE CHAIN-DERIVED TABLES ARE NOT DECLARED HERE
  * `groups`, `group_members`, `contributions`, `payouts`, `protocol_fees` and
@@ -42,4 +48,55 @@
  *    boundaries, denied CRUD, Storage policies, and server-only tables.
  */
 
-export {};
+import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+
+/**
+ * A user's public profile.
+ *
+ * Keyed by `user_id`, which is the Supabase Auth user id — the same value
+ * `auth.uid()` returns inside a policy. That is what makes the ownership check a
+ * direct comparison rather than a lookup through a second table.
+ *
+ * `display_name` and `avatar_path` are both nullable, and that is deliberate:
+ * the document requires that a profile photo "must not block signup", and the
+ * same reasoning applies to a display name. A row can therefore exist with
+ * nothing in it but the key, and a user who never sets a name is still a valid
+ * user. Defaulting either to a placeholder string would make "unset" and
+ * "deliberately set to this value" indistinguishable.
+ *
+ * `avatar_path` stores an object key, never a URL. The document is explicit on
+ * this: a stored URL outlives the bucket layout, leaks the storage host into the
+ * database, and cannot be re-signed when access policy changes.
+ *
+ * PRIMARY KEY, NOT A UNIQUE CONSTRAINT
+ * The document says `user_id unique`. A primary key is that uniqueness plus a
+ * NOT NULL that a bare unique constraint would not add, and it gives the
+ * ownership lookup an index for free. A nullable `user_id` would mean a profile
+ * nobody can reach — visible to no one and owned by no one.
+ *
+ * NO FOREIGN KEY IS DECLARED HERE
+ * In Supabase this should cascade from `auth.users`, so that deleting a user
+ * removes their profile. Drizzle cannot express "add this constraint only if the
+ * auth schema exists", and that condition is not hypothetical: CI runs plain
+ * Postgres, where `auth.users` does not exist, so an unconditional foreign key
+ * would fail to apply there. The constraint is added conditionally in
+ * `drizzle/0000_profiles.sql` instead, where the guard can be written out. See
+ * that file for the reasoning.
+ *
+ * `avatar_path` is intentionally not backed by Storage policies yet. The bucket
+ * and its owner-scoped policies land with the upload UI in the settings phase;
+ * adding the column now keeps the profile a single row rather than a migration
+ * later, and the column is unreachable until a policy exists to write it.
+ */
+export const profiles = pgTable('profiles', {
+  userId: uuid('user_id').primaryKey(),
+
+  displayName: text('display_name'),
+  avatarPath: text('avatar_path'),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type Profile = typeof profiles.$inferSelect;
+export type NewProfile = typeof profiles.$inferInsert;
