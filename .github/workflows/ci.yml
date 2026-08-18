@@ -84,7 +84,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Verify the guards pass on a clean database
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The guards inspect whatever is in the database, so the migrations are
+      # applied first.
+      #
+      # This step is the difference between a guard that protects the schema and
+      # one that only appears to. Run against an empty database, every guard
+      # passes because there is nothing to inspect, and a table can reach
+      # production with RLS missing while CI stays green.
+      - name: Bootstrap Supabase shims and apply migrations
+        run: |
+          set -euo pipefail
+          # Creates the roles, `auth.users` and `auth.uid()` that a hosted
+          # Supabase project provides. Plain Postgres has none of them, so
+          # without this the conditional foreign key in the profiles migration
+          # would take its skip branch on every run and go untested.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -f tests/db/bootstrap_supabase_shims.sql
+          pnpm db:migrate
+
+      - name: Verify the guards pass on the migrated database
         run: bash scripts/run-db-security-tests.sh
 
       - name: Verify the guards actually catch a table without RLS
