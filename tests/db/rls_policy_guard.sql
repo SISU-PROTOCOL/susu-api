@@ -284,11 +284,382 @@ $$;
 
 reset role;
 
+-- ===========================================================================
+-- 8. Phase 5 tables: wallet links, invites, notifications.
+--
+--    These are asserted here rather than in a separate file because the
+--    reasoning that makes them safe is the same reasoning as above: RLS plus
+--    grants plus column-level grants, and only the last of those can express
+--    "this column but not that one".
+--
+--    Two of the three tables are deliberately *less* reachable than a client
+--    would like, so the assertions below prove denial rather than access:
+--
+--      * wallet_links  — a binding is only meaningful if the server established
+--                        it, so the browser may read and nothing else.
+--      * invite_links  — a code is only meaningful if it cannot be listed, so
+--                        the browser is granted nothing at all.
+-- ===========================================================================
+
+\set wallet_one '''GBPJ3JJLZ7XPV6CGF3ABPSTXAATKRBCU2L6P66LHCGLYPBVMJX5BEFH6'''
+\set wallet_two '''GBG4MSIEUTONQSE7SSUQ6QZTQPNMKCSESZ6TZKZCMZRMAKZSDO6QPCYK'''
+\set group_id '''CCC7KAX4V4GJD6FVG6GSYQ4I2D2B3CWEOQMIX6YM4QBGXTA6INCGRUYC'''
+\set invite_code '''abcdefghijklmnopqrstuvwxyz0123456789ABCD'''
+
+insert into public.wallet_links (user_id, address) values
+  (:user_one, :wallet_one),
+  (:user_two, :wallet_two)
+on conflict (user_id) do nothing;
+
+insert into public.notifications (user_id, kind, title) values
+  (:user_one, 'payout_confirmed', 'Your payout was confirmed'),
+  (:user_two, 'payout_confirmed', 'Your payout was confirmed')
+on conflict do nothing;
+
+insert into public.invite_links (code, group_contract_id, created_by, max_uses) values
+  (:invite_code, :group_id, :user_one, 5)
+on conflict (code) do nothing;
+
+-- Referential behaviour, named before the assertions so a breakage reports its
+-- cause rather than surfacing later as a confusing count.
+--
+-- Counted rather than compared as a concatenated list: `string_agg` without an
+-- ORDER BY returns rows in whatever order the planner chose, so comparing the
+-- string would make this guard fail depending on the plan it happened to take.
+do $$
+declare cascading int;
+begin
+  select count(distinct t.relname)
+  into cascading
+  from pg_constraint c
+  join pg_class t on t.oid = c.conrelid
+  where t.relname in ('wallet_links', 'notifications', 'invite_links')
+    and c.contype = 'f'
+    and c.confdeltype = 'c';
+
+  if cascading <> 3 then
+    raise exception
+      'expected all three Phase 5 tables to cascade from auth.users; found %',
+      cascading;
+  end if;
+  raise notice 'ok: wallet_links, notifications and invite_links cascade from auth.users';
+end
+$$;
+
+-- The invite code shape is a security control, not a formatting preference: it
+-- is what stops this project repeating its own first mistake, where the group's
+-- contract address was used as the invite code. That value is long and
+-- high-entropy — so a length check passes it — but it is published on chain and
+-- therefore enumerable. Asserted as a refusal, because a constraint that is
+-- never exercised is a constraint that may not work.
+do $$
+declare refused boolean := false;
+begin
+  begin
+    insert into public.invite_links (code, group_contract_id, created_by)
+    values (:group_id, :group_id, :user_one);
+  exception when check_violation then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception
+      'a Stellar contract address was accepted as an invite code; it is publicly enumerable';
+  end if;
+  raise notice 'ok: an address-shaped invite code is refused';
+end
+$$;
+
+do $$
+declare refused boolean := false;
+begin
+  begin
+    insert into public.invite_links (code, group_contract_id, created_by)
+    values ('tooshort', :group_id, :user_one);
+  exception when check_violation then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception 'an invite code below the entropy floor was accepted';
+  end if;
+  raise notice 'ok: a short invite code is refused';
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8a. Anonymous users reach none of the three.
+-- ---------------------------------------------------------------------------
+reset role;
+select set_config('request.jwt.claim.sub', '', false);
+set role anon;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.wallet_links;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'anon was able to read public.wallet_links';
+  end if;
+  raise notice 'ok: anon cannot read wallet_links';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.invite_links;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'anon was able to read public.invite_links';
+  end if;
+  raise notice 'ok: anon cannot read invite_links';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.notifications;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'anon was able to read public.notifications';
+  end if;
+  raise notice 'ok: anon cannot read notifications';
+end
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 8b. A signed-in user reads only their own wallet binding, and cannot set it.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claim.sub', :user_one, false);
+set role authenticated;
+
+do $$
+declare n int;
+begin
+  select count(*) into n from public.wallet_links;
+  if n <> 1 then
+    raise exception 'user one saw % wallet link(s); expected only their own', n;
+  end if;
+  raise notice 'ok: user sees only their own wallet link';
+end
+$$;
+
+-- The heart of the design: binding requires proof of key control, so a client
+-- that could insert here would bypass the nonce-and-signature handshake entirely.
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.wallet_links (user_id, address)
+    values ('11111111-1111-1111-1111-111111111111', 'GBG4MSIEUTONQSE7SSUQ6QZTQPNMKCSESZ6TZKZCMZRMAKZSDO6QPCYK');
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to bind a wallet without proving control of it';
+  end if;
+  raise notice 'ok: clients cannot bind a wallet directly';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    update public.wallet_links set address = 'GBG4MSIEUTONQSE7SSUQ6QZTQPNMKCSESZ6TZKZCMZRMAKZSDO6QPCYK'
+    where user_id = '11111111-1111-1111-1111-111111111111';
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to rewrite their wallet binding';
+  end if;
+  raise notice 'ok: clients cannot rewrite a wallet binding';
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8c. Invite codes are not readable by any browser role.
+--
+--    This is the assertion that makes the opaque code worth generating. If a
+--    client could list invite rows, it would not need to guess a code.
+-- ---------------------------------------------------------------------------
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.invite_links;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'an authenticated user was able to read invite_links';
+  end if;
+  raise notice 'ok: authenticated users cannot read invite_links';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.invite_links (code, group_contract_id, created_by)
+    values ('zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', :group_id, :user_one);
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'an authenticated user was able to create an invite directly';
+  end if;
+  raise notice 'ok: authenticated users cannot create invites directly';
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8d. Notifications are user-owned: read, mark read, and nothing else.
+-- ---------------------------------------------------------------------------
+do $$
+declare n int;
+begin
+  select count(*) into n from public.notifications;
+  if n <> 1 then
+    raise exception 'user one saw % notification(s); expected only their own', n;
+  end if;
+  raise notice 'ok: user sees only their own notifications';
+end
+$$;
+
+begin;
+do $$
+declare n int;
+begin
+  update public.notifications set read_at = now()
+  where user_id = '11111111-1111-1111-1111-111111111111';
+  get diagnostics n = row_count;
+  if n <> 1 then
+    raise exception 'user one could not mark their own notification read (% row(s))', n;
+  end if;
+  raise notice 'ok: user marks their own notification read';
+end
+$$;
+rollback;
+
+-- Column grants are what stop a notification being rewritten into a different
+-- message. Without them, "payout confirmed" is a string the recipient's own
+-- client can author.
+do $$
+declare denied boolean := false;
+begin
+  begin
+    update public.notifications set title = 'Fake payout'
+    where user_id = '11111111-1111-1111-1111-111111111111';
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to rewrite a notification title';
+  end if;
+  raise notice 'ok: notification content is not client-writable';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.notifications (user_id, kind, title)
+    values ('11111111-1111-1111-1111-111111111111', 'payout_confirmed', 'Fake');
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to fabricate a notification';
+  end if;
+  raise notice 'ok: clients cannot fabricate notifications';
+end
+$$;
+
+do $$
+declare n int;
+begin
+  update public.notifications set read_at = now()
+  where user_id = '22222222-2222-2222-2222-222222222222';
+  get diagnostics n = row_count;
+  if n <> 0 then
+    raise exception 'user one marked % of another user''s notifications read', n;
+  end if;
+  raise notice 'ok: cannot reach another user''s notifications';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    delete from public.notifications;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to delete notifications';
+  end if;
+  raise notice 'ok: clients cannot delete notifications';
+end
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 8e. The server path reaches all three, including the one no browser may read.
+-- ---------------------------------------------------------------------------
+set role service_role;
+
+do $$
+declare wallets int; invites int; notes int;
+begin
+  select count(*) into wallets from public.wallet_links;
+  select count(*) into invites from public.invite_links;
+  select count(*) into notes from public.notifications;
+  if wallets < 2 or invites < 1 or notes < 2 then
+    raise exception
+      'service_role saw % wallets, % invites, % notifications; the server paths are blocked',
+      wallets, invites, notes;
+  end if;
+  raise notice 'ok: service_role reads wallet links, invites and notifications';
+end
+$$;
+
+reset role;
+
 -- ---------------------------------------------------------------------------
 -- Clean up. The mutating assertion was rolled back, so only the fixtures
 -- remain. Removing them here keeps the guard re-runnable and leaves a shared
 -- test database as it was found.
 -- ---------------------------------------------------------------------------
+delete from public.notifications where user_id in (:user_one, :user_two);
+delete from public.wallet_links where user_id in (:user_one, :user_two);
+delete from public.invite_links where created_by in (:user_one, :user_two);
 delete from public.profiles where user_id in (:user_one, :user_two);
 delete from auth.users where id in (:user_one, :user_two);
 
