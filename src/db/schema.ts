@@ -6,9 +6,16 @@
  * decision: a table without RLS is a table the browser can read, so the profile
  * table and its policies ship in the same migration.
  *
- * Only `profiles` is declared here. `wallet_links`, `invite_links` and
- * `notifications` belong to later phases ("Backend + invites"), and declaring
- * them now would mean shipping tables nothing writes to.
+ * Phase 4 declared `profiles` alone, on the grounds that declaring tables
+ * nothing writes to ships dead schema. Phase 5 is the phase that writes to them:
+ * `wallet_links`, `invite_links` and `notifications` arrive together with the
+ * endpoints and the signing flow that use them, so they are declared here now.
+ *
+ * Each of the three is deliberately narrower than the browser UI might like. The
+ * question that decided every grant below is "who is able to prove they are
+ * entitled to do this?", and for two of the three the answer is "only the
+ * server": a wallet binding is worthless if a client can declare it, and an
+ * invite code is worthless if a client can enumerate it.
  *
  * WHY THE CHAIN-DERIVED TABLES ARE NOT DECLARED HERE
  * `groups`, `group_members`, `contributions`, `payouts`, `protocol_fees` and
@@ -48,7 +55,7 @@
  *    boundaries, denied CRUD, Storage policies, and server-only tables.
  */
 
-import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { index, integer, jsonb, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * A user's public profile.
@@ -100,3 +107,162 @@ export const profiles = pgTable('profiles', {
 
 export type Profile = typeof profiles.$inferSelect;
 export type NewProfile = typeof profiles.$inferInsert;
+
+/**
+ * A Stellar wallet bound to an account.
+ *
+ * PRIMARY KEY ON `user_id`, UNIQUE ON `address`
+ * One wallet per account for the MVP, and one account per wallet. The primary
+ * key makes the first true by construction: changing wallets replaces the row
+ * rather than adding a second one, so there is never a moment where the app
+ * cannot say which wallet identifies this user. The unique address makes the
+ * second true, and it is the constraint that actually matters — without it two
+ * accounts could both claim the same wallet, and the app would have no way to
+ * decide which of them the chain considers the group member. That is a
+ * correctness problem, not a tidiness problem.
+ *
+ * WHY THE BROWSER MAY ONLY READ THIS TABLE
+ * Binding a wallet is a claim to control a keypair, so it is only worth
+ * anything if control is demonstrated. The flow is: authenticated session →
+ * server-issued nonce → wallet signature → server verification → row written.
+ * A client that could insert here directly would skip the middle three steps,
+ * and the signature check would be decorative. The API writes this table with
+ * the service role after verifying; `authenticated` is granted `select` on its
+ * own row and nothing else.
+ *
+ * The address format is constrained in SQL rather than only in Zod, because this
+ * column is what the rest of the system treats as an identity: a malformed value
+ * that reached it would be a row that can never match an on-chain member.
+ */
+export const walletLinks = pgTable('wallet_links', {
+  userId: uuid('user_id').primaryKey(),
+
+  address: text('address').notNull().unique(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * An invite to a group, addressed by an opaque code.
+ *
+ * WHY THE CODE IS NOT THE CONTRACT ADDRESS
+ * The frontend's first invite implementation used the group's contract address
+ * as the invite code, on the reasoning that it "grants nothing". That reasoning
+ * is sound about authority — the contract still decides who may join — but it
+ * misses that a contract address is *enumerable*. Anyone can walk the address
+ * space, or read it off the chain, and obtain the same page every invited member
+ * gets. The document therefore requires "opaque, random, expiring codes
+ * protected against enumeration", and this table is where that requirement
+ * lives: `code` is 32 random bytes in base64url, unrelated to any address.
+ *
+ * The check constraints in the migration pin the shape rather than trusting the
+ * generator: at least 22 characters of `[A-Za-z0-9_-]`, which is 132 bits of
+ * entropy at the floor, so a future code path cannot quietly start issuing
+ * short or structured codes. A second constraint rejects codes shaped like a
+ * Stellar address, because the first one permits them and that is exactly the
+ * mistake this project made the first time: a contract address is long,
+ * high-entropy, and publicly enumerable, which is the opposite of a secret.
+ *
+ * WHY THE BROWSER HAS NO ACCESS AT ALL
+ * Not even select. The whole value of the code is that it cannot be guessed, so
+ * a client that can list invite rows has defeated it without guessing anything.
+ * Creation is authorized and rate-limited by the API, and joins are resolved
+ * server-side: the API looks up the code, decides whether the join is allowed,
+ * and returns only the group that code points at. `authenticated` and `anon` are
+ * granted nothing here; the service role does all of it.
+ *
+ * NO FOREIGN KEY TO `groups`
+ * The group row belongs to the indexer, and an invite may legitimately be
+ * created during the window before the indexer has seen the group's creation
+ * event. A foreign key would turn ordinary index lag into a failed invite.
+ */
+export const inviteLinks = pgTable(
+  'invite_links',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    /** The secret. Opaque, random, unique. Never derived from an address. */
+    code: text('code').notNull().unique(),
+
+    /** The group this code admits to, as a Soroban contract address. */
+    groupContractId: text('group_contract_id').notNull(),
+
+    /** The user who created it. Cascades: an invite dies with its author. */
+    createdBy: uuid('created_by').notNull(),
+
+    /** Absent means the code does not expire. */
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+
+    /** Absent means unlimited uses, subject to the contract's own capacity. */
+    maxUses: integer('max_uses'),
+
+    /** Incremented on each successful join, under a row lock. */
+    uses: integer('uses').notNull().default(0),
+
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('invite_links_group_idx').on(table.groupContractId),
+    index('invite_links_created_by_idx').on(table.createdBy),
+  ],
+);
+
+/**
+ * A message addressed to one user.
+ *
+ * USER-OWNED, BUT NOT USER-WRITTEN
+ * A notification is only meaningful if the system issued it, so the browser is
+ * granted `select` on its own rows and `update` on the single column that means
+ * "I have seen this". It is granted no insert: a client that could write here
+ * could produce a notification claiming a payout had been confirmed, which is
+ * precisely the kind of message a user is meant to be able to trust. Rows are
+ * written by trusted paths — the API and the indexer — using the service role.
+ *
+ * `data` carries the context a notification needs to be actionable (the group
+ * contract address, a round number, a transaction hash) without the database
+ * having to grow a column per event type.
+ *
+ * `kind` is text with a format check rather than an enum. The set of kinds grows
+ * with the product — the document lists invites, due and confirmed
+ * contributions, payout ready and confirmed, completion and security events —
+ * and a Postgres enum would make each addition a migration on a table the
+ * indexer also writes to. The format check still stops a typo becoming a new
+ * kind nobody reads.
+ */
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    userId: uuid('user_id').notNull(),
+
+    /** A stable machine-readable event name, e.g. `payout_confirmed`. */
+    kind: text('kind').notNull(),
+
+    title: text('title').notNull(),
+    body: text('body'),
+
+    /** Event context. Never authoritative for money — the chain is. */
+    data: jsonb('data').notNull().default({}),
+
+    /** Null until the user has seen it. */
+    readAt: timestamp('read_at', { withTimezone: true }),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The list endpoint is always "my notifications, newest first", so the index
+    // is on the pair rather than on either column alone.
+    index('notifications_user_created_idx').on(table.userId, table.createdAt),
+  ],
+);
+
+export type WalletLink = typeof walletLinks.$inferSelect;
+export type NewWalletLink = typeof walletLinks.$inferInsert;
+export type InviteLink = typeof inviteLinks.$inferSelect;
+export type NewInviteLink = typeof inviteLinks.$inferInsert;
+export type Notification = typeof notifications.$inferSelect;
+export type NewNotification = typeof notifications.$inferInsert;
