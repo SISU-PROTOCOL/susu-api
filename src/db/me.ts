@@ -49,11 +49,7 @@ export function createAccountReadModel(db: Database): AccountReadModel {
    * absence of the whole account, and the two absences mean different things.
    */
   async function getAccount(userId: string): Promise<AccountView> {
-    const [profile] = await db
-      .select()
-      .from(profiles)
-      .where(eq(profiles.userId, userId))
-      .limit(1);
+    const [profile] = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1);
 
     const [wallet] = await db
       .select({ address: walletLinks.address })
