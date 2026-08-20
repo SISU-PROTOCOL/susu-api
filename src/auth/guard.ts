@@ -41,10 +41,7 @@ function unauthorized(reply: FastifyReply): void {
  * outage — without a network or a Supabase project.
  */
 export function createRequireAuth(verifyToken: TokenVerifier) {
-  return async function requireAuth(
-    request: FastifyRequest,
-    reply: FastifyReply,
-  ): Promise<void> {
+  return async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const header = request.headers.authorization;
     if (typeof header !== 'string' || !header.startsWith(BEARER_PREFIX)) {
       return unauthorized(reply);
