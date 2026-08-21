@@ -332,6 +332,20 @@ insert into public.invite_links (code, group_contract_id, created_by, max_uses) 
   (:invite_code, :group_id, :user_one, 5)
 on conflict (code) do nothing;
 
+-- Fixtures for the two server-only tables added with the wallet and invite
+-- flows. A denial assertion against an empty table proves nothing: it passes
+-- whether the privilege is absent or the table is simply empty, so both tables
+-- are given a row the browser roles must not be able to reach.
+insert into public.wallet_link_nonces (jti, user_id, expires_at) values
+  ('guardnonceaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', :user_one, now() + interval '5 minutes')
+on conflict (jti) do nothing;
+
+-- References the invite by its code rather than by a hard-coded id, so the
+-- redemption cannot silently stop pointing at the invite under test.
+insert into public.invite_redemptions (invite_id, user_id)
+select i.id, :user_two from public.invite_links i where i.code = :invite_code
+on conflict do nothing;
+
 -- Referential behaviour, named before the assertions so a breakage reports its
 -- cause rather than surfacing later as a confusing count.
 --
@@ -454,6 +468,36 @@ begin
     raise exception 'anon was able to read public.notifications';
   end if;
   raise notice 'ok: anon cannot read notifications';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.wallet_link_nonces;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'anon was able to read public.wallet_link_nonces';
+  end if;
+  raise notice 'ok: anon cannot read spent nonces';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.invite_redemptions;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'anon was able to read public.invite_redemptions';
+  end if;
+  raise notice 'ok: anon cannot read invite redemptions';
 end
 $$;
 
@@ -649,25 +693,108 @@ begin
 end
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 8e. Spent nonces and invite redemptions are server-only.
+--
+-- Both tables exist to hold a fact the client must not be able to assert: that a
+-- nonce has been spent, and that a user has consumed a use of an invite. So the
+-- assertion here is denial for every operation, including select — a client that
+-- could read this data learns which nonces exist, and one that could write it
+-- defeats the control the table was created for.
+-- ---------------------------------------------------------------------------
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.wallet_link_nonces;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'an authenticated user read spent nonces';
+  end if;
+  raise notice 'ok: authenticated users cannot read spent nonces';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.wallet_link_nonces (jti, user_id, expires_at)
+    values ('clientchosenid0000000000000000000000', current_setting('guard.user_id')::uuid,
+            now() + interval '5 minutes');
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to write a spent nonce, which it could replay to deny itself';
+  end if;
+  raise notice 'ok: clients cannot write spent nonces';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.invite_redemptions;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'an authenticated user read invite redemptions';
+  end if;
+  raise notice 'ok: authenticated users cannot read invite redemptions';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.invite_redemptions (invite_id, user_id)
+    select id, current_setting('guard.user_id')::uuid from public.invite_links limit 1;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client was able to record a redemption, which would burn an invite''s uses';
+  end if;
+  raise notice 'ok: clients cannot record invite redemptions';
+end
+$$;
+
 reset role;
 
 -- ---------------------------------------------------------------------------
--- 8e. The server path reaches all three, including the one no browser may read.
+-- 8f. The server path reaches all of these, including the tables no browser may
+--     read. `service_role` is the role the API connects as, so a deny here would
+--     mean the wallet and invite flows could not work at all.
 -- ---------------------------------------------------------------------------
 set role service_role;
 
 do $$
-declare wallets int; invites int; notes int;
+declare wallets int; invites int; notes int; nonces int; redemptions int;
 begin
   select count(*) into wallets from public.wallet_links;
   select count(*) into invites from public.invite_links;
   select count(*) into notes from public.notifications;
+  select count(*) into nonces from public.wallet_link_nonces;
+  select count(*) into redemptions from public.invite_redemptions;
   if wallets < 2 or invites < 1 or notes < 2 then
     raise exception
       'service_role saw % wallets, % invites, % notifications; the server paths are blocked',
       wallets, invites, notes;
   end if;
-  raise notice 'ok: service_role reads wallet links, invites and notifications';
+  if nonces < 1 or redemptions < 1 then
+    raise exception
+      'service_role saw % nonce(s) and % redemption(s); the wallet and invite flows are blocked',
+      nonces, redemptions;
+  end if;
+  raise notice 'ok: service_role reaches wallet links, invites, notifications, nonces and redemptions';
 end
 $$;
 
@@ -678,6 +805,9 @@ reset role;
 -- remain. Removing them here keeps the guard re-runnable and leaves a shared
 -- test database as it was found.
 -- ---------------------------------------------------------------------------
+delete from public.invite_redemptions
+  where invite_id in (select id from public.invite_links where created_by in (:user_one, :user_two));
+delete from public.wallet_link_nonces where user_id in (:user_one, :user_two);
 delete from public.notifications where user_id in (:user_one, :user_two);
 delete from public.wallet_links where user_id in (:user_one, :user_two);
 delete from public.invite_links where created_by in (:user_one, :user_two);

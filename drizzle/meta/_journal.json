@@ -15,6 +15,13 @@
       "when": 1789262677259,
       "tag": "0001_invites_and_linking",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789276302809,
+      "tag": "0002_nonces_and_redemptions",
+      "breakpoints": true
     }
   ]
 }
