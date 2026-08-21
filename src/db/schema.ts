@@ -55,7 +55,16 @@
  *    boundaries, denied CRUD, Storage policies, and server-only tables.
  */
 
-import { index, integer, jsonb, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import {
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
 
 /**
  * A user's public profile.
@@ -266,3 +275,92 @@ export type InviteLink = typeof inviteLinks.$inferSelect;
 export type NewInviteLink = typeof inviteLinks.$inferInsert;
 export type Notification = typeof notifications.$inferSelect;
 export type NewNotification = typeof notifications.$inferInsert;
+
+/**
+ * A wallet-link nonce that has been spent.
+ *
+ * WHY THIS TABLE EXISTS AT ALL
+ * The nonce itself is not stored. It is an HMAC-signed token the server can
+ * validate without a lookup: rotating `WALLET_NONCE_SECRET` invalidates every
+ * outstanding nonce at once, and issuing one costs no write. What a signed token
+ * cannot do by itself is be *single-use* — the same token verifies as many times
+ * as it is presented until it expires. This table is the part that cannot be
+ * derived, so it is the part that is stored.
+ *
+ * The primary key is the nonce id, so a replay is not a check that can pass — it
+ * is an insert that cannot succeed. Uniqueness is enforced by the index rather
+ * than by reading first and deciding second, which is the difference between a
+ * guarantee and a race.
+ *
+ * `expires_at` is stored rather than recomputed so the row can be reaped without
+ * the secret: a cleanup that needed to verify a signature to know it could delete
+ * a row would be unable to clean up after a key rotation.
+ *
+ * Server-only. No browser role is granted anything here, and RLS is enabled with
+ * no policies: knowing which nonces exist is of no use to a client, and the
+ * values are written and read exclusively by the API.
+ */
+export const walletLinkNonces = pgTable(
+  'wallet_link_nonces',
+  {
+    /** The nonce's unique id, from the signed token. */
+    jti: text('jti').primaryKey(),
+
+    /** The account the nonce was issued to. A nonce is not transferable. */
+    userId: uuid('user_id').notNull(),
+
+    /** When the token stops being valid, copied from the token's own claim. */
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+
+    consumedAt: timestamp('consumed_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The reaper's query is "delete everything past its expiry", so the index is
+    // on the expiry alone rather than on the pair.
+    index('wallet_link_nonces_expires_at_idx').on(table.expiresAt),
+  ],
+);
+
+/**
+ * A record that a user redeemed an invite.
+ *
+ * WHY A JOIN TABLE AND NOT JUST A COUNTER
+ * `invite_links.uses` is a counter, and a counter cannot express "this user has
+ * already redeemed this code". Without that fact, a member who opens their invite
+ * link twice consumes two of a limited code's uses, and the code runs out on a
+ * group that is not full. The document asks for a join that is *idempotent*, and
+ * idempotence requires remembering who has joined — which is what this table is.
+ *
+ * The primary key is the pair, so the second redemption is a conflict rather than
+ * a duplicate row, and the increment can be made conditional on this insert
+ * having happened. The two facts — "who joined" and "how many uses" — are then
+ * written in one transaction under a lock on the invite, and cannot disagree.
+ *
+ * Server-only, like the table it records: a client that could insert here could
+ * burn a limited invite's uses without joining.
+ */
+export const inviteRedemptions = pgTable(
+  'invite_redemptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    /** The invite that was redeemed. */
+    inviteId: uuid('invite_id').notNull(),
+
+    /** The account that redeemed it. */
+    userId: uuid('user_id').notNull(),
+
+    redeemedAt: timestamp('redeemed_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The uniqueness that makes redemption idempotent. Named so a conflict in
+    // application code can be told apart from any other unique violation.
+    uniqueIndex('invite_redemptions_invite_user_key').on(table.inviteId, table.userId),
+    index('invite_redemptions_user_idx').on(table.userId),
+  ],
+);
+
+export type WalletLinkNonce = typeof walletLinkNonces.$inferSelect;
+export type NewWalletLinkNonce = typeof walletLinkNonces.$inferInsert;
+export type InviteRedemption = typeof inviteRedemptions.$inferSelect;
+export type NewInviteRedemption = typeof inviteRedemptions.$inferInsert;
