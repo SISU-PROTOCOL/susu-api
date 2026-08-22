@@ -6,6 +6,8 @@ import { getEnv } from './lib/env';
 import { buildLoggerOptions } from './lib/logger';
 import { createGroupReadModel, type GroupReadModel } from './db/groups';
 import { createAccountReadModel, type AccountReadModel } from './db/me';
+import { createWalletLinkStore, type WalletLinkStore } from './db/wallet';
+import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
 import { getDb } from './db/client';
 import { createRequireAuth } from './auth/guard';
 import { createTokenVerifier, type TokenVerifier } from './auth/verify';
@@ -17,6 +19,7 @@ import {
 import { healthRoutes } from './routes/health';
 import { groupRoutes } from './routes/groups';
 import { meRoutes } from './routes/me';
+import { walletRoutes } from './routes/wallet';
 
 /**
  * Dependencies a caller may substitute.
@@ -31,6 +34,8 @@ export type BuildServerOptions = {
   accountReadModel?: AccountReadModel;
   verifyToken?: TokenVerifier;
   deleteAccount?: AccountDeleter;
+  walletLinkStore?: WalletLinkStore;
+  nonceIssuer?: NonceIssuer;
 };
 
 /**
@@ -91,6 +96,22 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     accountReadModel: options.accountReadModel ?? createAccountReadModel(getDb()),
     requireAuth: createRequireAuth(verifyToken),
     deleteAccount,
+  });
+
+  // Wallet linking is a two-step authenticated handshake. The nonce issuer holds
+  // the signing secret and the message shape; the store owns the two facts the
+  // database enforces — that a nonce is spent once, and that an address belongs
+  // to one account.
+  await app.register(walletRoutes, {
+    prefix: '/api/v1',
+    requireAuth: createRequireAuth(verifyToken),
+    store: options.walletLinkStore ?? createWalletLinkStore(getDb()),
+    nonces:
+      options.nonceIssuer ??
+      createNonceIssuer({
+        secret: env.WALLET_NONCE_SECRET,
+        networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE,
+      }),
   });
 
   // Versioned application surface. `getDb()` builds a connection pool lazily, so
