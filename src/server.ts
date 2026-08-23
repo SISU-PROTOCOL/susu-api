@@ -7,6 +7,7 @@ import { buildLoggerOptions } from './lib/logger';
 import { createGroupReadModel, type GroupReadModel } from './db/groups';
 import { createAccountReadModel, type AccountReadModel } from './db/me';
 import { createWalletLinkStore, type WalletLinkStore } from './db/wallet';
+import { createInviteStore, type InviteStore } from './db/invites';
 import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
 import { getDb } from './db/client';
 import { createRequireAuth } from './auth/guard';
@@ -18,6 +19,7 @@ import {
 } from './supabase/admin';
 import { healthRoutes } from './routes/health';
 import { groupRoutes } from './routes/groups';
+import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
 import { walletRoutes } from './routes/wallet';
 
@@ -36,6 +38,7 @@ export type BuildServerOptions = {
   deleteAccount?: AccountDeleter;
   walletLinkStore?: WalletLinkStore;
   nonceIssuer?: NonceIssuer;
+  inviteStore?: InviteStore;
 };
 
 /**
@@ -115,10 +118,21 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   });
 
   // Versioned application surface. `getDb()` builds a connection pool lazily, so
-  // constructing the read model opens no connection until the first query.
+  // constructing the read model opens no connection until the first query. One
+  // instance is shared by the public group routes and by the invite routes, which
+  // need it to tell "this group has nothing yet" from "there is no such group".
+  const groupReadModel = options.readModel ?? createGroupReadModel(getDb());
+
   await app.register(groupRoutes, {
     prefix: '/api/v1',
-    readModel: options.readModel ?? createGroupReadModel(getDb()),
+    readModel: groupReadModel,
+  });
+
+  await app.register(inviteRoutes, {
+    prefix: '/api/v1',
+    requireAuth: createRequireAuth(verifyToken),
+    store: options.inviteStore ?? createInviteStore(getDb()),
+    groupExists: (contractId) => groupReadModel.groupExists(contractId),
   });
 
   app.setNotFoundHandler(async (_request, reply) => {
