@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import type { GroupReadModel, PageResult } from '../db/groups';
+import type { GroupReadModel } from '../db/groups';
+import { envelope, paginationFields } from '../lib/pagination';
 import { invalidRequest } from './errors';
 
 /**
@@ -15,21 +16,6 @@ import { invalidRequest } from './errors';
  * acknowledges the same thing, and a client that needs certainty reads the
  * contract.
  */
-
-/** Default page size when a request does not ask for one. */
-export const DEFAULT_LIMIT = 20;
-
-/** Largest page the API will serve, regardless of what is asked for. */
-export const MAX_LIMIT = 100;
-
-/**
- * Furthest offset the API will serve.
- *
- * Deep offsets make the database walk every skipped row, so a large one is a
- * cheap way to request an expensive query. A client needing to page beyond this
- * should narrow its filter instead.
- */
-export const MAX_OFFSET = 10_000;
 
 /**
  * Chain-derived data is public and changes only when the indexer runs, so it is
@@ -55,11 +41,6 @@ const contractIdParams = z.object({
   contractId: z.string().regex(CONTRACT_ID_PATTERN, 'must be a Soroban contract address'),
 });
 
-const paginationFields = {
-  limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT),
-  offset: z.coerce.number().int().min(0).max(MAX_OFFSET).default(0),
-};
-
 const listGroupsQuery = z.object({
   status: z.enum(['open', 'active', 'completed']).optional(),
   creator: z.string().regex(ADDRESS_PATTERN, 'must be a Stellar address').optional(),
@@ -75,13 +56,6 @@ export type GroupRoutesOptions = {
 
 function groupNotFound(reply: FastifyReply): FastifyReply {
   return reply.code(404).send({ error: 'group_not_found' });
-}
-
-function envelope<T>(result: PageResult<T>, limit: number, offset: number) {
-  return {
-    data: result.items,
-    page: { limit, offset, hasMore: result.hasMore },
-  };
 }
 
 /**
