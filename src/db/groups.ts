@@ -1,6 +1,7 @@
 import { sql, type SQL } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { assertBaseUnits, assertCount } from '../lib/base-units';
+import type { Page, PageResult } from '../lib/pagination';
 import type * as schema from './schema';
 
 /**
@@ -118,15 +119,9 @@ export type ListGroupsQuery = {
   readonly offset: number;
 };
 
-export type Page = {
-  readonly limit: number;
-  readonly offset: number;
-};
-
-export type PageResult<T> = {
-  readonly items: readonly T[];
-  readonly hasMore: boolean;
-};
+// Pagination types are shared with every other paginated resource; they are
+// re-exported here so the read model's existing import sites do not change.
+export type { Page, PageResult } from '../lib/pagination';
 
 export type GroupReadModel = {
   listGroups(query: ListGroupsQuery): Promise<PageResult<GroupSummary>>;

@@ -8,6 +8,7 @@ import { createGroupReadModel, type GroupReadModel } from './db/groups';
 import { createAccountReadModel, type AccountReadModel } from './db/me';
 import { createWalletLinkStore, type WalletLinkStore } from './db/wallet';
 import { createInviteStore, type InviteStore } from './db/invites';
+import { createNotificationReadModel, type NotificationReadModel } from './db/notifications';
 import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
 import { getDb } from './db/client';
 import { createRequireAuth } from './auth/guard';
@@ -21,6 +22,7 @@ import { healthRoutes } from './routes/health';
 import { groupRoutes } from './routes/groups';
 import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
+import { notificationRoutes } from './routes/notifications';
 import { walletRoutes } from './routes/wallet';
 
 /**
@@ -39,6 +41,7 @@ export type BuildServerOptions = {
   walletLinkStore?: WalletLinkStore;
   nonceIssuer?: NonceIssuer;
   inviteStore?: InviteStore;
+  notificationReadModel?: NotificationReadModel;
 };
 
 /**
@@ -133,6 +136,15 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     requireAuth: createRequireAuth(verifyToken),
     store: options.inviteStore ?? createInviteStore(getDb()),
     groupExists: (contractId) => groupReadModel.groupExists(contractId),
+  });
+
+  // Notifications are user-owned and injected as a model, like the account routes
+  // above: the API connects as the database owner, so RLS does not apply to these
+  // queries and each statement scopes to the caller itself.
+  await app.register(notificationRoutes, {
+    prefix: '/api/v1',
+    requireAuth: createRequireAuth(verifyToken),
+    readModel: options.notificationReadModel ?? createNotificationReadModel(getDb()),
   });
 
   app.setNotFoundHandler(async (_request, reply) => {

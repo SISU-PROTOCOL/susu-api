@@ -31,6 +31,7 @@
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import { UUID_SHAPE } from './uuid';
 
 /** How long a nonce stays valid. Short enough that a captured one is stale. */
 export const NONCE_TTL_SECONDS = 5 * 60;
@@ -39,18 +40,10 @@ export const NONCE_TTL_SECONDS = 5 * 60;
 const JTI_BYTES = 32;
 
 const claimsSchema = z.object({
-  // The user id, validated for shape rather than by RFC 4122 rules.
-  //
-  // The token is already authenticated by its MAC, so this check exists to catch
-  // a code bug producing a malformed claim — not to establish identity, which
-  // happened at authentication. `z.string().uuid()` additionally enforces the
-  // version and variant nibbles, which are statements about how an id was
-  // generated; that is Supabase's business. Rejecting on variant would mean a
-  // real account whose id is not a v4 could not link a wallet, which is a
-  // production failure for a check that buys nothing here.
-  u: z
-    .string()
-    .regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/),
+  // The user id, validated for shape rather than by RFC 4122 rules — see
+  // `src/lib/uuid.ts` for why a version check here would be a production failure
+  // rather than a safety measure.
+  u: z.string().regex(UUID_SHAPE),
   a: z.string().regex(/^[GC][A-Z2-7]{55}$/),
   i: z.number().int().nonnegative(),
   e: z.number().int().nonnegative(),
