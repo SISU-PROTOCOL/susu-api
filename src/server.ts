@@ -9,6 +9,7 @@ import { createAccountReadModel, type AccountReadModel } from './db/me';
 import { createWalletLinkStore, type WalletLinkStore } from './db/wallet';
 import { createInviteStore, type InviteStore } from './db/invites';
 import { createNotificationReadModel, type NotificationReadModel } from './db/notifications';
+import { createTransactionReadModel, type TransactionReadModel } from './db/transactions';
 import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
 import { getDb } from './db/client';
 import { createRequireAuth } from './auth/guard';
@@ -23,6 +24,7 @@ import { groupRoutes } from './routes/groups';
 import { inviteRoutes } from './routes/invites';
 import { meRoutes } from './routes/me';
 import { notificationRoutes } from './routes/notifications';
+import { transactionRoutes } from './routes/transactions';
 import { walletRoutes } from './routes/wallet';
 
 /**
@@ -42,6 +44,7 @@ export type BuildServerOptions = {
   nonceIssuer?: NonceIssuer;
   inviteStore?: InviteStore;
   notificationReadModel?: NotificationReadModel;
+  transactionReadModel?: TransactionReadModel;
 };
 
 /**
@@ -145,6 +148,13 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     prefix: '/api/v1',
     requireAuth: createRequireAuth(verifyToken),
     readModel: options.notificationReadModel ?? createNotificationReadModel(getDb()),
+  });
+
+  // Public and read-only, like the group routes: a transaction's events are on
+  // the ledger already, so there is nothing here to authorise.
+  await app.register(transactionRoutes, {
+    prefix: '/api/v1',
+    readModel: options.transactionReadModel ?? createTransactionReadModel(getDb()),
   });
 
   app.setNotFoundHandler(async (_request, reply) => {
