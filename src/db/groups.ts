@@ -2,6 +2,7 @@ import { sql, type SQL } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { assertBaseUnits, assertCount } from '../lib/base-units';
 import type { Page, PageResult } from '../lib/pagination';
+import { paginate, queryRows as rawQueryRows } from './raw';
 import type * as schema from './schema';
 
 /**
@@ -308,28 +309,9 @@ const GROUP_COLUMNS = sql`
   last_event_ledger
 `;
 
-/**
- * Splits rows fetched with `limit + 1` into a page and a "there is more" flag.
- *
- * Fetching one extra row avoids a `count(*)` over the whole table on every
- * request, and the extra row is dropped here so it cannot leak into a response.
- */
-function paginate<T>(rows: readonly T[], limit: number): PageResult<T> {
-  const hasMore = rows.length > limit;
-  return { items: hasMore ? rows.slice(0, limit) : rows, hasMore };
-}
-
-function rowsOf(result: { rows?: unknown }): readonly unknown[] {
-  const rows = result.rows;
-  if (!Array.isArray(rows)) {
-    throw new Error('Database read returned no row array');
-  }
-  return rows;
-}
-
 export function createGroupReadModel(db: NodePgDatabase<typeof schema>): GroupReadModel {
   async function queryRows(statement: SQL): Promise<readonly unknown[]> {
-    return rowsOf(await db.execute(statement));
+    return rawQueryRows(db, statement);
   }
 
   return {
