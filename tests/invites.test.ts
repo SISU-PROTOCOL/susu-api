@@ -33,7 +33,14 @@ function fakeStore(): FakeStore {
       uses: 0,
       createdAt: new Date(0).toISOString(),
     })),
-    redeem: vi.fn(async () => ({ outcome: 'redeemed', inviteId: 'invite-id' }) as RedeemOutcome),
+    redeem: vi.fn(
+      async () =>
+        ({
+          outcome: 'redeemed',
+          inviteId: 'invite-id',
+          groupContractId: GROUP_CONTRACT_ID,
+        }) as RedeemOutcome,
+    ),
   } as unknown as FakeStore;
 }
 
@@ -218,12 +225,12 @@ describe('POST /api/v1/groups/:contractId/invites', () => {
   });
 });
 
-describe('POST /api/v1/groups/:contractId/join', () => {
+describe('POST /api/v1/invites/redeem', () => {
   it('refuses an unauthenticated request', async () => {
     const { app } = await harness();
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       payload: { code: CODE },
     });
 
@@ -235,7 +242,7 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: CODE },
     });
@@ -245,12 +252,51 @@ describe('POST /api/v1/groups/:contractId/join', () => {
       groupContractId: GROUP_CONTRACT_ID,
       inviteId: 'invite-id',
     });
-    // The user is the token's, never the body's.
-    expect(store.redeem).toHaveBeenCalledWith({
-      code: CODE,
-      groupContractId: GROUP_CONTRACT_ID,
-      userId: USER_ID,
+    // The user is the token's, never the body's. The store is not told which
+    // group: the code names it, which is what lets an invite link work without
+    // carrying an address.
+    expect(store.redeem).toHaveBeenCalledWith({ code: CODE, userId: USER_ID });
+  });
+
+  it('needs no group address, because the code identifies the group', async () => {
+    const { app, store } = await harness();
+
+    // The code is the whole request. An invite link carries a code and nothing
+    // else, so a redemption that required a contract id could never be made from
+    // one.
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invites/redeem',
+      headers: AUTH,
+      payload: { code: CODE },
     });
+
+    expect(response.statusCode).toBe(200);
+    expect(store.redeem).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the group the code admits to', async () => {
+    const store = fakeStore();
+    store.redeem = vi.fn(
+      async () =>
+        ({
+          outcome: 'redeemed',
+          inviteId: 'invite-id',
+          groupContractId: OTHER_CONTRACT_ID,
+        }) as RedeemOutcome,
+    );
+    const { app } = await harness({ store });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invites/redeem',
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    // The caller has no other way to learn it, and needs it to send the on-chain
+    // join.
+    expect(response.json().data.groupContractId).toBe(OTHER_CONTRACT_ID);
   });
 
   it('refuses a code shaped like a Stellar address without a lookup', async () => {
@@ -258,7 +304,7 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: `C${'A'.repeat(55)}` },
     });
@@ -273,7 +319,7 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: 'short' },
     });
@@ -282,9 +328,9 @@ describe('POST /api/v1/groups/:contractId/join', () => {
     expect(store.redeem).not.toHaveBeenCalled();
   });
 
-  it('reports an unknown, expired, revoked or wrong-group code identically', async () => {
-    // One answer for all four. Any distinction would confirm that a guessed code
-    // is real, which is the one thing an unguessable code must not reveal.
+  it('reports an unknown, expired or revoked code identically', async () => {
+    // One answer for all three. Any distinction would confirm that a guessed
+    // code is real, which is the one thing an unguessable code must not reveal.
     for (const outcome of ['not_found', 'expired', 'revoked'] as const) {
       const store = fakeStore();
       store.redeem = vi.fn(async () => ({ outcome }) as RedeemOutcome);
@@ -292,7 +338,7 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
       const response = await app.inject({
         method: 'POST',
-        url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+        url: '/api/v1/invites/redeem',
         headers: AUTH,
         payload: { code: CODE },
       });
@@ -309,7 +355,7 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: CODE },
     });
@@ -325,13 +371,13 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     const first = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: CODE },
     });
     const second = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: { code: CODE },
     });
@@ -341,31 +387,31 @@ describe('POST /api/v1/groups/:contractId/join', () => {
     expect(store.redeem).toHaveBeenCalledTimes(2);
   });
 
-  it('reports an unknown group before considering the code', async () => {
-    const { app, store } = await harness({ known: false });
-
-    const response = await app.inject({
-      method: 'POST',
-      url: `/api/v1/groups/${OTHER_CONTRACT_ID}/join`,
-      headers: AUTH,
-      payload: { code: CODE },
-    });
-
-    expect(response.statusCode).toBe(404);
-    expect(response.json()).toEqual({ error: 'group_not_found' });
-    expect(store.redeem).not.toHaveBeenCalled();
-  });
-
   it('refuses a missing code', async () => {
     const { app } = await harness();
 
     const response = await app.inject({
       method: 'POST',
-      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      url: '/api/v1/invites/redeem',
       headers: AUTH,
       payload: {},
     });
 
     expect(response.statusCode).toBe(400);
+  });
+
+  it('does not leak the code into a cacheable response', async () => {
+    const { app } = await harness();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/invites/redeem',
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    // The response names the group rather than echoing the code, so a shared
+    // cache never holds the secret.
+    expect(response.json().data.code).toBeUndefined();
   });
 });

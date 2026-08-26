@@ -41,9 +41,15 @@ export type InviteRecord = {
 };
 
 export type RedeemOutcome =
-  /** The use was claimed, or had already been claimed by this same user. */
-  | { readonly outcome: 'redeemed'; readonly inviteId: string }
-  /** No such code. Also returned for a code that belongs to another group. */
+  /**
+   * The use was claimed, or had already been claimed by this same user.
+   *
+   * `groupContractId` is returned because the code is what identifies the group:
+   * an invite link carries a code and no address, so the caller learns which
+   * contract to join from this.
+   */
+  | { readonly outcome: 'redeemed'; readonly inviteId: string; readonly groupContractId: string }
+  /** No such code. */
   | { readonly outcome: 'not_found' }
   | { readonly outcome: 'revoked' }
   | { readonly outcome: 'expired' }
@@ -59,13 +65,13 @@ export type InviteStore = {
   }): Promise<InviteRecord>;
 
   /**
-   * Claims a use of the invite identified by `code`, for a join to
-   * `groupContractId` by `userId`.
+   * Claims a use of the invite identified by `code`, for a join by `userId`, and
+   * reports which group the code admits to.
    *
    * Idempotent per (invite, user): redeeming twice succeeds both times and
    * consumes one use.
    */
-  redeem(input: { code: string; groupContractId: string; userId: string }): Promise<RedeemOutcome>;
+  redeem(input: { code: string; userId: string }): Promise<RedeemOutcome>;
 };
 
 function toRecord(row: schema.InviteLink): InviteRecord {
@@ -99,7 +105,7 @@ export function createInviteStore(db: Database): InviteStore {
       return toRecord(row);
     },
 
-    async redeem({ code, groupContractId, userId }) {
+    async redeem({ code, userId }) {
       return db.transaction(async (tx) => {
         // `for update` is the whole reason this is a transaction. Without it the
         // capacity check below is advisory: two concurrent joins would both read
@@ -117,10 +123,11 @@ export function createInviteStore(db: Database): InviteStore {
           return { outcome: 'expired' } as const;
         }
 
-        // A code for a different group is reported as absent rather than as a
-        // mismatch. Telling the caller it exists would confirm the code is real,
-        // which is the one thing an unguessable code is supposed to withhold.
-        if (invite.groupContractId !== groupContractId) return { outcome: 'not_found' } as const;
+        // The code identifies the group, which is the point of it: an invite link
+        // carries the code and nothing else, so a lookup that needed the contract
+        // address as well could never be satisfied by the link. `code` is unique,
+        // so this is a single row.
+        const groupContractId = invite.groupContractId;
 
         // Checked before capacity, so a member who already redeemed is idempotent
         // even when the invite has since filled up. Reporting "exhausted" to
@@ -134,7 +141,9 @@ export function createInviteStore(db: Database): InviteStore {
           )
           .limit(1);
 
-        if (existing !== undefined) return { outcome: 'redeemed', inviteId: invite.id } as const;
+        if (existing !== undefined) {
+          return { outcome: 'redeemed', inviteId: invite.id, groupContractId } as const;
+        }
 
         if (invite.maxUses !== null && invite.uses >= invite.maxUses) {
           return { outcome: 'exhausted' } as const;
@@ -150,7 +159,7 @@ export function createInviteStore(db: Database): InviteStore {
           .set({ uses: sql`${inviteLinks.uses} + 1` })
           .where(eq(inviteLinks.id, invite.id));
 
-        return { outcome: 'redeemed', inviteId: invite.id } as const;
+        return { outcome: 'redeemed', inviteId: invite.id, groupContractId } as const;
       });
     },
   };
