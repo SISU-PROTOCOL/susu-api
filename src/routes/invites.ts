@@ -17,12 +17,19 @@
  * contract address are already public.
  *
  * JOIN CLAIMS A USE, IT DOES NOT JOIN
- * The blockchain is the only thing that can add a member, so `POST /groups/:id/join`
- * cannot be the join. What it does is validate the code, claim one of its uses,
- * and return the group so the client can send the transaction that actually joins.
- * A use is claimed before the transaction succeeds, which is the conservative
- * direction: a failed transaction wastes a use rather than letting a limited code
- * admit more members than it should.
+ * The blockchain is the only thing that can add a member, so redemption cannot be
+ * the join. What `POST /invites/redeem` does is validate the code, claim one of its
+ * uses, and report which group the code admits to, so the client can send the
+ * transaction that actually joins. A use is claimed before that transaction
+ * succeeds, which is the conservative direction: a failed transaction wastes a use
+ * rather than letting a limited code admit more members than it should.
+ *
+ * WHY REDEMPTION IS NOT GROUP-SCOPED
+ * An invite link carries a code and nothing else — that is what makes it opaque.
+ * The code is unique and its row names the group, so a caller holding only the
+ * code can still redeem; requiring the contract address would mean the link could
+ * never satisfy the request. Creation is still group-scoped, because a code is
+ * created *for* a group.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -69,7 +76,7 @@ const createBody = z.object({
   maxUses: z.coerce.number().int().min(1, 'must be a positive number of uses').max(1000).optional(),
 });
 
-const joinBody = z.object({
+const redeemBody = z.object({
   code: z.string().trim().min(1, 'must be an invite code'),
 });
 
@@ -132,16 +139,9 @@ export async function inviteRoutes(
     });
   });
 
-  app.post('/groups/:contractId/join', { preHandler: requireAuth }, async (request, reply) => {
-    const parsedParams = params.safeParse(request.params);
-    if (!parsedParams.success) return invalidRequest(reply, parsedParams.error);
-
-    const parsedBody = joinBody.safeParse(request.body);
+  app.post('/invites/redeem', { preHandler: requireAuth }, async (request, reply) => {
+    const parsedBody = redeemBody.safeParse(request.body);
     if (!parsedBody.success) return invalidRequest(reply, parsedBody.error);
-
-    const { contractId } = parsedParams.data;
-
-    if (!(await groupExists(contractId))) return groupNotFound(reply);
 
     const { code } = parsedBody.data;
     // Refused on shape before any lookup. A stream of short or address-shaped
@@ -149,14 +149,15 @@ export async function inviteRoutes(
     if (!isWellFormedInviteCode(code)) return inviteNotFound(reply);
 
     const user = authenticatedUser(request);
-    const result = await store.redeem({ code, groupContractId: contractId, userId: user.id });
+    const result = await store.redeem({ code, userId: user.id });
 
     switch (result.outcome) {
       case 'redeemed':
         // Either this is the first redemption or this user redeemed before; both
-        // are success, which is what makes retrying a join safe.
+        // are success, which is what makes retrying a join safe. The group comes
+        // from the code, not from the request.
         return reply.send({
-          data: { groupContractId: contractId, inviteId: result.inviteId },
+          data: { groupContractId: result.groupContractId, inviteId: result.inviteId },
         });
       case 'exhausted':
         // Distinct from not_found because the caller did nothing wrong and a
