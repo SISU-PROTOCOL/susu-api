@@ -24,12 +24,17 @@
  * succeeds, which is the conservative direction: a failed transaction wastes a use
  * rather than letting a limited code admit more members than it should.
  *
- * WHY REDEMPTION IS NOT GROUP-SCOPED
+ * WHY REDEMPTION HAS TWO SHAPES
  * An invite link carries a code and nothing else — that is what makes it opaque.
- * The code is unique and its row names the group, so a caller holding only the
- * code can still redeem; requiring the contract address would mean the link could
- * never satisfy the request. Creation is still group-scoped, because a code is
- * created *for* a group.
+ * The code is unique and its row names the group, so `POST /invites/redeem` needs
+ * only the code, and reports the group so a client that arrived from a link can go
+ * on to send the join transaction. Requiring the contract address there would mean
+ * a link could never satisfy the request.
+ *
+ * `POST /groups/:contractId/join` is the same claim for a caller that already
+ * knows the group, plus the assertion that the code belongs to it. The path's
+ * group is not what identifies anything; it is a consistency check on the client,
+ * for the case where the code and the group came from different places.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -102,6 +107,58 @@ export async function inviteRoutes(
   const { store, groupExists, requireAuth } = options;
   const now = options.now ?? (() => new Date());
 
+  /**
+   * Claims a use of `code` for the authenticated user.
+   *
+   * Shared by both join shapes. They differ only in the last step: the
+   * group-scoped one also asserts that the code admits to the group in its path,
+   * which turns a client bug — redeeming a code for a different group than the
+   * one being displayed — into an error rather than a quiet join to somewhere
+   * else.
+   */
+  async function claimUse(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    expectedGroup?: string,
+  ): Promise<FastifyReply> {
+    const parsedBody = redeemBody.safeParse(request.body);
+    if (!parsedBody.success) return invalidRequest(reply, parsedBody.error);
+
+    const { code } = parsedBody.data;
+    // Refused on shape before any lookup. A stream of short or address-shaped
+    // codes would otherwise be a stream of indexed queries.
+    if (!isWellFormedInviteCode(code)) return inviteNotFound(reply);
+
+    const user = authenticatedUser(request);
+    const result = await store.redeem({ code, userId: user.id });
+
+    switch (result.outcome) {
+      case 'redeemed':
+        // The code names the group. A caller that supplied a different one asked
+        // about the wrong group, which is answered the same way as an unknown
+        // code: the code is not for that group, and saying so confirms nothing
+        // about codes in general.
+        if (expectedGroup !== undefined && result.groupContractId !== expectedGroup) {
+          return inviteNotFound(reply);
+        }
+
+        // Either this is the first redemption or this user redeemed before; both
+        // are success, which is what makes retrying a join safe.
+        return reply.send({
+          data: { groupContractId: result.groupContractId, inviteId: result.inviteId },
+        });
+      case 'exhausted':
+        // Distinct from not_found because the caller did nothing wrong and a
+        // fresh invite is a real remedy — and knowing the code was real tells
+        // them nothing they did not already have.
+        return reply.code(409).send({ error: 'invite_exhausted' });
+      case 'revoked':
+      case 'expired':
+      case 'not_found':
+        return inviteNotFound(reply);
+    }
+  }
+
   app.post('/groups/:contractId/invites', { preHandler: requireAuth }, async (request, reply) => {
     const parsedParams = params.safeParse(request.params);
     if (!parsedParams.success) return invalidRequest(reply, parsedParams.error);
@@ -139,35 +196,27 @@ export async function inviteRoutes(
     });
   });
 
+  /**
+   * Redemption for a caller holding only the code.
+   *
+   * This is the shape an invite link needs: `/join/<code>` carries no address, so
+   * this is also how the client learns which group the code admits to.
+   */
   app.post('/invites/redeem', { preHandler: requireAuth }, async (request, reply) => {
-    const parsedBody = redeemBody.safeParse(request.body);
-    if (!parsedBody.success) return invalidRequest(reply, parsedBody.error);
+    return claimUse(request, reply);
+  });
 
-    const { code } = parsedBody.data;
-    // Refused on shape before any lookup. A stream of short or address-shaped
-    // codes would otherwise be a stream of indexed queries.
-    if (!isWellFormedInviteCode(code)) return inviteNotFound(reply);
+  /**
+   * Redemption for a caller that already knows the group.
+   *
+   * The same claim, plus the assertion that the code belongs to the group in the
+   * path. A client that has a code and a group from different places can get that
+   * wrong, and this is where the mismatch is caught.
+   */
+  app.post('/groups/:contractId/join', { preHandler: requireAuth }, async (request, reply) => {
+    const parsedParams = params.safeParse(request.params);
+    if (!parsedParams.success) return invalidRequest(reply, parsedParams.error);
 
-    const user = authenticatedUser(request);
-    const result = await store.redeem({ code, userId: user.id });
-
-    switch (result.outcome) {
-      case 'redeemed':
-        // Either this is the first redemption or this user redeemed before; both
-        // are success, which is what makes retrying a join safe. The group comes
-        // from the code, not from the request.
-        return reply.send({
-          data: { groupContractId: result.groupContractId, inviteId: result.inviteId },
-        });
-      case 'exhausted':
-        // Distinct from not_found because the caller did nothing wrong and a
-        // fresh invite is a real remedy — and knowing the code was real tells
-        // them nothing they did not already have.
-        return reply.code(409).send({ error: 'invite_exhausted' });
-      case 'revoked':
-      case 'expired':
-      case 'not_found':
-        return inviteNotFound(reply);
-    }
+    return claimUse(request, reply, parsedParams.data.contractId);
   });
 }
