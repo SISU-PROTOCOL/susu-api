@@ -415,3 +415,105 @@ describe('POST /api/v1/invites/redeem', () => {
     expect(response.json().data.code).toBeUndefined();
   });
 });
+describe('POST /api/v1/groups/:contractId/join', () => {
+  it('refuses an unauthenticated request', async () => {
+    const { app, store } = await harness();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      payload: { code: CODE },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(store.redeem).not.toHaveBeenCalled();
+  });
+
+  it('redeems a code for the authenticated user', async () => {
+    const { app, store } = await harness();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data).toEqual({
+      groupContractId: GROUP_CONTRACT_ID,
+      inviteId: 'invite-id',
+    });
+    expect(store.redeem).toHaveBeenCalledWith({ code: CODE, userId: USER_ID });
+  });
+
+  it('reports a code for a different group as absent', async () => {
+    const store = fakeStore();
+    store.redeem = vi.fn(
+      async () =>
+        ({
+          outcome: 'redeemed',
+          inviteId: 'invite-id',
+          groupContractId: OTHER_CONTRACT_ID,
+        }) as RedeemOutcome,
+    );
+    const { app } = await harness({ store });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    // The whole reason this shape exists: a client whose code and group came from
+    // different places gets told, rather than being quietly joined to the other
+    // group. Reported as absent rather than as a mismatch, so it confirms nothing
+    // about the code.
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: 'invite_not_found' });
+  });
+
+  it('accepts a code whose group matches the path', async () => {
+    const { app } = await harness();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('refuses a malformed contract id without a lookup', async () => {
+    const { app, store } = await harness();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/groups/not-a-contract/join',
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(store.redeem).not.toHaveBeenCalled();
+  });
+
+  it('reports an exhausted code distinctly, as the code-scoped shape does', async () => {
+    const store = fakeStore();
+    store.redeem = vi.fn(async () => ({ outcome: 'exhausted' }) as RedeemOutcome);
+    const { app } = await harness({ store });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/join`,
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'invite_exhausted' });
+  });
+});
