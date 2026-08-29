@@ -46,17 +46,23 @@ function fakeStore(): FakeStore {
 
 type Harness = { app: FastifyInstance; store: FakeStore; groupExists: ReturnType<typeof vi.fn> };
 
-async function harness(options: { store?: FakeStore; known?: boolean } = {}): Promise<Harness> {
+async function harness(
+  options: { store?: FakeStore; known?: boolean; registered?: boolean } = {},
+): Promise<Harness> {
   const { buildServer } = await import('../src/server');
 
   const store = options.store ?? fakeStore();
   const groupExists = vi.fn(async () => options.known ?? true);
+  // The index trailing the chain is the case this covers: `known` is the index's
+  // answer, `registered` the creator's unexpired registration.
+  const isRegistered = vi.fn(async () => options.registered ?? false);
   const verify = vi.fn(async () => ({ id: USER_ID, email: 'ada@example.com' }));
 
   const app = await buildServer({
     probeDatabase: async () => {},
     verifyToken: verify as unknown as TokenVerifier,
     inviteStore: store,
+    registrations: { register: vi.fn(), isRegistered } as never,
     readModel: {
       groupExists,
       listGroups: vi.fn(),
@@ -195,6 +201,48 @@ describe('POST /api/v1/groups/:contractId/invites', () => {
 
     expect(response.statusCode).toBe(404);
     expect(response.json()).toEqual({ error: 'group_not_found' });
+    expect(store.create).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The index trails the chain by up to one scheduled run, and a creator who has
+   * just made a group is the person about to invite someone to it. Before this,
+   * the route refused for the length of that lag — the document's journey is
+   * "create group, then share invite", and the middle of it did not work.
+   */
+  it('creates a code for a group the indexer has not seen yet but its creator registered', async () => {
+    const { app, store, groupExists } = await harness({ known: false, registered: true });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/invites`,
+      headers: AUTH,
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().data.groupContractId).toBe(GROUP_CONTRACT_ID);
+    expect(store.create).toHaveBeenCalledWith(
+      expect.objectContaining({ groupContractId: GROUP_CONTRACT_ID }),
+    );
+    // The index was still asked first: a registration is a fallback for the gap,
+    // not a way to skip the authority.
+    expect(groupExists).toHaveBeenCalledWith(GROUP_CONTRACT_ID);
+  });
+
+  it('refuses a registration that has expired', async () => {
+    // `registered: false` is what an expired registration reports: the store
+    // filters on the expiry, so expiry and absence are the same answer here.
+    const { app, store } = await harness({ known: false, registered: false });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/v1/groups/${GROUP_CONTRACT_ID}/invites`,
+      headers: AUTH,
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(404);
     expect(store.create).not.toHaveBeenCalled();
   });
 

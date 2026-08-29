@@ -54,8 +54,16 @@ export const MAX_INVITE_TTL_HOURS = 24 * 30;
 
 export type InviteRoutesOptions = {
   store: InviteStore;
-  /** Answers whether the indexer knows this group. Injected to keep this narrow. */
-  groupExists: (contractId: string) => Promise<boolean>;
+  /**
+   * Answers whether this API recognises the address as a group.
+   *
+   * Deliberately not "does the indexer know this group". Between a creator's
+   * confirmation and the indexer's next run — up to one scheduled interval — the
+   * address is real and the index has never seen it, and a creator who has just
+   * made a group is exactly the person about to invite someone to it. The check is
+   * therefore the index *or* an unexpired registration; see `db/registrations.ts`.
+   */
+  isKnownGroup: (contractId: string) => Promise<boolean>;
   requireAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   /** Injectable so tests can assert the expiry rather than race a clock. */
   now?: () => Date;
@@ -104,7 +112,7 @@ export async function inviteRoutes(
   app: FastifyInstance,
   options: InviteRoutesOptions,
 ): Promise<void> {
-  const { store, groupExists, requireAuth } = options;
+  const { store, isKnownGroup, requireAuth } = options;
   const now = options.now ?? (() => new Date());
 
   /**
@@ -167,7 +175,10 @@ export async function inviteRoutes(
     if (!parsedBody.success) return invalidRequest(reply, parsedBody.error);
 
     const { contractId } = parsedParams.data;
-    if (!(await groupExists(contractId))) return groupNotFound(reply);
+    // Recognised means the index knows it, or the creator registered it after a
+    // confirmation the indexer has not reached yet. Both answer the only question
+    // this gate is asking: is this an address a code may name.
+    if (!(await isKnownGroup(contractId))) return groupNotFound(reply);
 
     const user = authenticatedUser(request);
     const ttlHours = parsedBody.data.expiresInHours ?? DEFAULT_INVITE_TTL_HOURS;
