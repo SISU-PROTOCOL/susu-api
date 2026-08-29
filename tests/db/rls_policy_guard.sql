@@ -35,6 +35,12 @@
 \set user_one '''11111111-1111-1111-1111-111111111111'''
 \set user_two '''22222222-2222-2222-2222-222222222222'''
 
+-- A contract address and a classic account address, for the registration shape
+-- assertions. The same values the fixtures use, so a failure here refers to the
+-- same address a unit test would.
+\set group_contract_id '''CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'''
+\set account_address '''GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'''
+
 -- ---------------------------------------------------------------------------
 -- Fixtures.
 --
@@ -760,7 +766,7 @@ begin
     denied := true;
   end;
 
-  if not denied then
+    if not denied then
     raise exception 'a client was able to record a redemption, which would burn an invite''s uses';
   end if;
   raise notice 'ok: clients cannot record invite redemptions';
@@ -770,20 +776,154 @@ $$;
 reset role;
 
 -- ---------------------------------------------------------------------------
--- 8f. The server path reaches all of these, including the tables no browser may
+-- 8f. Group registrations are server-only, in both directions.
+--
+-- The claim itself is not a secret — it is an address the chain already
+-- published — but the *set* of them is: it is the list of addresses this API
+-- currently believes are groups without the index having confirmed it, which is
+-- exactly the list worth presenting to an invite endpoint. So no browser role
+-- reads it and none writes it; the client learns the outcome of its own
+-- registration from the response to the write, and nothing else.
+--
+-- The shape constraints are asserted here too. They are the last place a
+-- malformed address or a window that is already over can be refused, and a
+-- registration that is born expired would read as a success and behave as a
+-- failure.
+-- ---------------------------------------------------------------------------
+set role anon;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.group_registrations;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'an anonymous user read group registrations';
+  end if;
+  raise notice 'ok: anonymous users cannot read group registrations';
+end
+$$;
+
+reset role;
+set role authenticated;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    perform count(*) from public.group_registrations;
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+  if not denied then
+    raise exception 'an authenticated user read group registrations';
+  end if;
+  raise notice 'ok: authenticated users cannot read group registrations';
+end
+$$;
+
+do $$
+declare denied boolean := false;
+begin
+  begin
+    insert into public.group_registrations (contract_id, registered_by, expires_at)
+    values (:group_contract_id, current_setting('guard.user_id')::uuid,
+            now() + interval '10 minutes');
+  exception when insufficient_privilege then
+    denied := true;
+  end;
+
+  if not denied then
+    raise exception 'a client registered a group, which could hold the window open on its own';
+  end if;
+  raise notice 'ok: clients cannot register groups';
+end
+$$;
+
+reset role;
+
+-- The shape constraints, exercised as the role that does write these rows.
+set role service_role;
+
+do $$
+declare refused boolean := false;
+begin
+  -- A classic account address. A group is a contract, so this could never
+  -- resolve, and the database refuses it rather than storing a claim that cannot
+  -- become true.
+  begin
+    insert into public.group_registrations (contract_id, registered_by, expires_at)
+    values (:account_address, :user_one, now() + interval '10 minutes');
+  exception when check_violation then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception 'a non-contract address was stored as a group registration';
+  end if;
+  raise notice 'ok: registrations are refused for anything but a contract address';
+end
+$$;
+
+do $$
+declare refused boolean := false;
+begin
+  -- An inverted window: the claim would end before it began. This is the window
+  -- the table can refuse in a constraint. A window that is merely stale cannot be
+  -- — `now()` is not immutable, so it has no place in a CHECK — which is why the
+  -- read predicate filters on it instead, and why the store computes the expiry
+  -- rather than accepting one.
+  begin
+    insert into public.group_registrations (contract_id, registered_by, created_at, expires_at)
+    values (:group_contract_id, :user_two, now(), now() - interval '1 hour');
+  exception when check_violation then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception 'a registration whose window ends before it starts was accepted';
+  end if;
+  raise notice 'ok: registrations are refused when their window is inverted';
+end
+$$;
+
+do $$
+begin
+  insert into public.group_registrations (contract_id, registered_by, expires_at)
+  values (:group_contract_id, :user_one, now() + interval '30 minutes')
+  on conflict (contract_id) do nothing;
+
+  if not exists (
+    select 1 from public.group_registrations
+    where contract_id = :group_contract_id and expires_at > now()
+  ) then
+    raise exception 'the server could not register a group, so the invite window cannot be bridged';
+  end if;
+  raise notice 'ok: the server path registers groups';
+end
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 8g. The server path reaches all of these, including the tables no browser may
 --     read. `service_role` is the role the API connects as, so a deny here would
---     mean the wallet and invite flows could not work at all.
+--     mean the wallet, invite and registration flows could not work at all.
 -- ---------------------------------------------------------------------------
 set role service_role;
 
 do $$
-declare wallets int; invites int; notes int; nonces int; redemptions int;
+declare wallets int; invites int; notes int; nonces int; redemptions int; registrations int;
 begin
   select count(*) into wallets from public.wallet_links;
   select count(*) into invites from public.invite_links;
   select count(*) into notes from public.notifications;
   select count(*) into nonces from public.wallet_link_nonces;
   select count(*) into redemptions from public.invite_redemptions;
+  select count(*) into registrations from public.group_registrations;
   if wallets < 2 or invites < 1 or notes < 2 then
     raise exception
       'service_role saw % wallets, % invites, % notifications; the server paths are blocked',
@@ -794,7 +934,12 @@ begin
       'service_role saw % nonce(s) and % redemption(s); the wallet and invite flows are blocked',
       nonces, redemptions;
   end if;
-  raise notice 'ok: service_role reaches wallet links, invites, notifications, nonces and redemptions';
+  if registrations < 1 then
+    raise exception
+      'service_role saw no group registrations; a creator could not invite anyone until the indexer caught up';
+  end if;
+  raise notice
+    'ok: service_role reaches wallet links, invites, notifications, nonces, redemptions and registrations';
 end
 $$;
 
@@ -805,6 +950,7 @@ reset role;
 -- remain. Removing them here keeps the guard re-runnable and leaves a shared
 -- test database as it was found.
 -- ---------------------------------------------------------------------------
+delete from public.group_registrations where registered_by in (:user_one, :user_two);
 delete from public.invite_redemptions
   where invite_id in (select id from public.invite_links where created_by in (:user_one, :user_two));
 delete from public.wallet_link_nonces where user_id in (:user_one, :user_two);

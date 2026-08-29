@@ -4,9 +4,9 @@
 
 Backend API for **Susu Protocol** — a non-custodial rotating savings protocol on Stellar.
 
-> **Status: Phase 6 — group read model.** Health endpoints, configuration validation and
-> the read-only group API over the indexer's chain-derived tables are in place. Write
-> endpoints and wallet linking land from Phase 7 onwards. Nothing here is audited.
+> **Status: Phase 6 — group read model.** Health endpoints, configuration validation,
+> the read-only group API over the indexer's chain-derived tables, accounts, wallet
+> linking, invites and notifications are in place. Nothing here is audited.
 
 ## This service is not a custodian
 
@@ -33,6 +33,7 @@ Node.js · TypeScript · Fastify · Zod · Drizzle ORM · PostgreSQL (Supabase) 
 | `GET` | `/api/v1/groups/:contractId/contributions` | Contributions, in round then ledger order. |
 | `GET` | `/api/v1/groups/:contractId/payouts` | Payouts, net of the protocol fee. |
 | `GET` | `/api/v1/groups/:contractId/activity` | Every decoded event, as the audit trail. |
+| `POST` | `/api/v1/groups` | Records a group address the chain has just produced, for a bounded window. See below. |
 
 Lists are paginated with `limit` (default 20, max 100) and `offset` (max 10000), and
 return `{ data, page: { limit, offset, hasMore } }`.
@@ -42,7 +43,40 @@ wallet endpoint, because the answer is the same list under a different filter.
 
 Planned surface (from Phase 7): `/api/v1/me`, `/api/v1/wallet/nonce`,
 `/api/v1/wallet/verify`, `/api/v1/groups/:id/join`, `/api/v1/groups/:id/invites`,
-`/api/v1/transactions/prepare`, `/api/v1/transactions/:hash`, `/api/v1/notifications`.
+`/api/v1/transactions/:hash`, `/api/v1/notifications`.
+
+One path from the document's surface is deliberately absent: `POST
+/api/v1/transactions/prepare`. Building or simulating a transaction is the browser's job
+in this design — it holds the key, it simulates against Soroban RPC, and it signs — so a
+server-side "prepare" would either duplicate work the client already does or become the
+one place a transaction's contents are decided away from the user's key. The endpoint has
+a legitimate form only if it means *fee sponsorship*: the server holds a funded account
+and wraps the client's signed transaction in a fee bump, so members need no XLM. That
+would put a spending key in this service and is a product decision, not an implementation
+detail, so it is not done unnoticed.
+
+## Why `POST /api/v1/groups` exists and does not create a group
+
+A group's address is the hash of its own deployment, so the only way to learn that a
+group exists is to watch the Factory emit it. The indexer does that on a schedule, which
+means there is a window after a creator's confirmation in which the address is real, is
+on the public ledger, and is unknown to this API. Creating an invite requires the API to
+recognise the group, so without this endpoint a creator could create a group and then be
+unable to invite anyone to it until the indexer's next run — the middle of the product's
+core journey, blocked by a scheduler.
+
+The body is `{ "contractId": "C…" }` and nothing else. The response is the address and
+when the claim lapses. What is stored is an address, the account that claimed it, and an
+expiry: no amount, no membership, no status. It cannot make a contract exist, nothing
+financial reads it, and it is believed only until it expires — after which the index is
+the only thing that can vouch for the address. An account may hold a handful of live
+claims at once, so the window cannot be held open across many addresses.
+
+The claim is **not** verified against the chain. Verifying it would mean this service
+decoding Soroban event XDR, and the exposure it would close is a code naming an address
+that turns out not to be a group — which grants nothing, because the contract decides
+who may join. Rate limiting invitation abuse is the proper mitigation and is separate
+work.
 
 ## The read model
 

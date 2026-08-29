@@ -364,3 +364,67 @@ export type WalletLinkNonce = typeof walletLinkNonces.$inferSelect;
 export type NewWalletLinkNonce = typeof walletLinkNonces.$inferInsert;
 export type InviteRedemption = typeof inviteRedemptions.$inferSelect;
 export type NewInviteRedemption = typeof inviteRedemptions.$inferInsert;
+
+/**
+ * A group that has been created on chain but not yet indexed.
+ *
+ * THE GAP THIS CLOSES
+ * A group's address is the hash of its own deployment, so the only way to know a
+ * group exists is to have watched the Factory emit it — which is what the indexer
+ * does, on a five-minute schedule. Between a creator's confirmation and the
+ * indexer's next run there is a window in which the address is real, is on the
+ * public ledger, and is unknown to this API.
+ *
+ * The schema already anticipated that window for invites: `invite_links` has no
+ * foreign key to the group, with the reasoning that "an invite may legitimately be
+ * created during the window before the indexer has seen the group's creation
+ * event". The route then closed the window again by refusing to create an invite
+ * for a group it could not find, so a creator could not share an invite until the
+ * indexer caught up. This table is what lets the route honour the intent: the
+ * creator registers the address the chain just gave them, and the API treats it as
+ * a group for a short while.
+ *
+ * WHAT THIS IS NOT
+ * It is not a group. Nothing financial reads it, it carries no amount, no
+ * membership, no status, and a row here does not make a contract exist. `groups`
+ * remains the indexer's table and the index remains the authority on what a group
+ * is; this is a claim with an expiry, and the index overwrites it by simply
+ * existing. Because of that, `expires_at` is the load-bearing column: the
+ * registration stops being believed on its own, without anything having to run.
+ *
+ * WHY A CLAIM IS ACCEPTABLE HERE
+ * Invite creation is already open to any authenticated account for any group the
+ * index knows — a code grants no authority, and the contract decides who may join
+ * — so a registration widens the set of addresses a code can name, not the power a
+ * code has. The cost of a false claim is bounded by the expiry, and capped per
+ * account so a single account cannot hold the window open on many addresses at
+ * once. Verifying the claim against the chain instead would mean this service
+ * encoding and decoding Soroban XDR, which is a larger and more fragile thing than
+ * the gap it would close; the real mitigation for invitation abuse is rate
+ * limiting, which is a separate piece of work.
+ */
+export const groupRegistrations = pgTable(
+  'group_registrations',
+  {
+    /** The address the chain returned. One claim per address. */
+    contractId: text('contract_id').primaryKey(),
+
+    /** The account that made the claim. Cascades: a claim dies with its author. */
+    registeredBy: uuid('registered_by').notNull(),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+
+    /** After this instant the index is the only thing that can vouch for the row. */
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    // Every read is "is this address registered and still within its window", so
+    // the expiry is filtered on and indexed rather than only stored.
+    index('group_registrations_expires_at_idx').on(table.expiresAt),
+    // The per-account cap counts a user's live claims, which is this index.
+    index('group_registrations_registered_by_idx').on(table.registeredBy),
+  ],
+);
+
+export type GroupRegistration = typeof groupRegistrations.$inferSelect;
+export type NewGroupRegistration = typeof groupRegistrations.$inferInsert;

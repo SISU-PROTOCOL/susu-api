@@ -8,6 +8,7 @@ import { createGroupReadModel, type GroupReadModel } from './db/groups';
 import { createAccountReadModel, type AccountReadModel } from './db/me';
 import { createWalletLinkStore, type WalletLinkStore } from './db/wallet';
 import { createInviteStore, type InviteStore } from './db/invites';
+import { createRegistrationStore, type RegistrationStore } from './db/registrations';
 import { createNotificationReadModel, type NotificationReadModel } from './db/notifications';
 import { createTransactionReadModel, type TransactionReadModel } from './db/transactions';
 import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
@@ -43,6 +44,7 @@ export type BuildServerOptions = {
   walletLinkStore?: WalletLinkStore;
   nonceIssuer?: NonceIssuer;
   inviteStore?: InviteStore;
+  registrations?: RegistrationStore;
   notificationReadModel?: NotificationReadModel;
   transactionReadModel?: TransactionReadModel;
 };
@@ -129,16 +131,38 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   // need it to tell "this group has nothing yet" from "there is no such group".
   const groupReadModel = options.readModel ?? createGroupReadModel(getDb());
 
+  // The registrations a creator makes when the indexer has not yet seen their
+  // group. Shared by the route that records them and the invite gate that honours
+  // them, so the two cannot disagree about what "known" means.
+  const registrations = options.registrations ?? createRegistrationStore(getDb());
+
+  /**
+   * Whether an address may be treated as a group.
+   *
+   * The index is the authority, but it trails the chain by up to one indexing run,
+   * and the creator is the person most likely to need the API to recognise a group
+   * in exactly that window. An unexpired registration is the same answer for a
+   * bounded while; see `db/registrations.ts` for why a claim is acceptable here.
+   */
+  const isKnownGroup = async (contractId: string): Promise<boolean> => {
+    if (await groupReadModel.groupExists(contractId)) return true;
+    return registrations.isRegistered(contractId);
+  };
+
+  const requireAuth = createRequireAuth(verifyToken);
+
   await app.register(groupRoutes, {
     prefix: '/api/v1',
     readModel: groupReadModel,
+    requireAuth,
+    registrations,
   });
 
   await app.register(inviteRoutes, {
     prefix: '/api/v1',
-    requireAuth: createRequireAuth(verifyToken),
+    requireAuth,
     store: options.inviteStore ?? createInviteStore(getDb()),
-    groupExists: (contractId) => groupReadModel.groupExists(contractId),
+    isKnownGroup,
   });
 
   // Notifications are user-owned and injected as a model, like the account routes
