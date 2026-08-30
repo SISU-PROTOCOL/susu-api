@@ -324,6 +324,13 @@ reset role;
 select set_config('guard.group_id', :group_id, false),
        set_config('guard.user_id', :user_one, false);
 
+-- The registration assertions below need a contract address, a classic account
+-- address and a second user inside `do $$` blocks, where psql does not
+-- substitute. Republished here for the same reason, and from the same values.
+select set_config('guard.group_contract_id', :group_contract_id, false),
+       set_config('guard.account_address', :account_address, false),
+       set_config('guard.user_two', :user_two, false);
+
 insert into public.wallet_links (user_id, address) values
   (:user_one, :wallet_one),
   (:user_two, :wallet_two)
@@ -830,7 +837,7 @@ declare denied boolean := false;
 begin
   begin
     insert into public.group_registrations (contract_id, registered_by, expires_at)
-    values (:group_contract_id, current_setting('guard.user_id')::uuid,
+    values (current_setting('guard.group_contract_id'), current_setting('guard.user_id')::uuid,
             now() + interval '10 minutes');
   exception when insufficient_privilege then
     denied := true;
@@ -856,7 +863,8 @@ begin
   -- become true.
   begin
     insert into public.group_registrations (contract_id, registered_by, expires_at)
-    values (:account_address, :user_one, now() + interval '10 minutes');
+    values (current_setting('guard.account_address'), current_setting('guard.user_id')::uuid,
+            now() + interval '10 minutes');
   exception when check_violation then
     refused := true;
   end;
@@ -878,7 +886,8 @@ begin
   -- rather than accepting one.
   begin
     insert into public.group_registrations (contract_id, registered_by, created_at, expires_at)
-    values (:group_contract_id, :user_two, now(), now() - interval '1 hour');
+    values (current_setting('guard.group_contract_id'), current_setting('guard.user_two')::uuid,
+            now(), now() - interval '1 hour');
   exception when check_violation then
     refused := true;
   end;
@@ -893,12 +902,13 @@ $$;
 do $$
 begin
   insert into public.group_registrations (contract_id, registered_by, expires_at)
-  values (:group_contract_id, :user_one, now() + interval '30 minutes')
+  values (current_setting('guard.group_contract_id'), current_setting('guard.user_id')::uuid,
+          now() + interval '30 minutes')
   on conflict (contract_id) do nothing;
 
   if not exists (
     select 1 from public.group_registrations
-    where contract_id = :group_contract_id and expires_at > now()
+    where contract_id = current_setting('guard.group_contract_id') and expires_at > now()
   ) then
     raise exception 'the server could not register a group, so the invite window cannot be bridged';
   end if;
