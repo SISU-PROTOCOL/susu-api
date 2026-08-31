@@ -6,7 +6,8 @@ Backend API for **Susu Protocol** — a non-custodial rotating savings protocol 
 
 > **Status: Phase 6 — group read model.** Health endpoints, configuration validation,
 > the read-only group API over the indexer's chain-derived tables, accounts, wallet
-> linking, invites and notifications are in place. Nothing here is audited.
+> linking, invites, notifications, transaction receipts and transaction preparation are
+> in place. Nothing here is audited.
 
 ## This service is not a custodian
 
@@ -34,6 +35,8 @@ Node.js · TypeScript · Fastify · Zod · Drizzle ORM · PostgreSQL (Supabase) 
 | `GET` | `/api/v1/groups/:contractId/payouts` | Payouts, net of the protocol fee. |
 | `GET` | `/api/v1/groups/:contractId/activity` | Every decoded event, as the audit trail. |
 | `POST` | `/api/v1/groups` | Records a group address the chain has just produced, for a bounded window. See below. |
+| `GET` | `/api/v1/transactions/:txHash` | The decoded receipt for one transaction. Public. |
+| `POST` | `/api/v1/transactions/prepare` | Simulates one contract invocation and returns it with a footprint and fee. Authenticated. See below. |
 
 Lists are paginated with `limit` (default 20, max 100) and `offset` (max 10000), and
 return `{ data, page: { limit, offset, hasMore } }`.
@@ -41,19 +44,48 @@ return `{ data, page: { limit, offset, hasMore } }`.
 Filtering by `member` is how a wallet's groups are read — there is no separate
 wallet endpoint, because the answer is the same list under a different filter.
 
-Planned surface (from Phase 7): `/api/v1/me`, `/api/v1/wallet/nonce`,
-`/api/v1/wallet/verify`, `/api/v1/groups/:id/join`, `/api/v1/groups/:id/invites`,
-`/api/v1/transactions/:hash`, `/api/v1/notifications`.
+The account surface is `GET`, `PATCH` and `DELETE /api/v1/me`; wallet linking is
+`POST /api/v1/wallet/nonce` then `POST /api/v1/wallet/verify`; invites are created with
+`POST /api/v1/groups/:contractId/invites` and redeemed with `POST /api/v1/invites/redeem`
+(codes are opaque, so the client learns the group from the response) or
+`POST /api/v1/groups/:contractId/join` when the client already knows it; notifications are
+`GET /api/v1/notifications` and `POST /api/v1/notifications/:id/read`.
 
-One path from the document's surface is deliberately absent: `POST
-/api/v1/transactions/prepare`. Building or simulating a transaction is the browser's job
-in this design — it holds the key, it simulates against Soroban RPC, and it signs — so a
-server-side "prepare" would either duplicate work the client already does or become the
-one place a transaction's contents are decided away from the user's key. The endpoint has
-a legitimate form only if it means *fee sponsorship*: the server holds a funded account
-and wraps the client's signed transaction in a fee bump, so members need no XLM. That
-would put a spending key in this service and is a product decision, not an implementation
-detail, so it is not done unnoticed.
+## Why `POST /api/v1/transactions/prepare` exists and cannot move money
+
+The document's transaction UX is validate → build → simulate → show details → sign, and it
+places transaction preparation in this service's surface. The endpoint takes an unsigned
+envelope the **client** built (`{ "transactionXdr": "AAAA…" }`), asks Soroban RPC to
+simulate it, and returns the same call with the resource footprint and fee filled in.
+
+It is deliberately an envelope API, not an intent API. An intent-shaped body — "contribute
+to group X" — would put this service in the position of deciding an operation's contract,
+method and arguments, which is exactly the financial authority the API is not allowed to
+have. Given an envelope, the most a compromised API can do is make a call valid or refuse
+it; it never holds a key, never signs, and never submits. That is why the response is
+checked to still be the caller's own contract, method and source account before it is
+returned (`src/lib/prepare.ts`), and why a fee-bump envelope is refused rather than
+unwrapped.
+
+Three further limits are worth stating plainly:
+
+- **It is allow-listed.** Only the Factory and groups the index (or a live registration)
+  knows about can be simulated here. Without that, the endpoint is an open simulation
+  proxy paid for by this service.
+- **It is authenticated.** A session is required before any RPC work happens.
+- **It is not required.** The web app builds, simulates, assembles and submits locally
+  (`susu-web/src/lib/stellar/`), because a write must not depend on this service being up.
+  Nothing in the product is blocked when prepare is unavailable; it exists so that a
+  client without a Soroban SDK — or one that cannot reach RPC directly — has a path.
+
+A contract's refusal is reported as `200` with `status: "refused"` and the raw host error,
+not as an HTTP failure: the request was well-formed and the contract said no, and the
+client already owns the error table that explains why. An expired footprint is
+`status: "restore_required"`, which is a different remedy and must not be shown to a user
+as a failed action.
+
+Fee sponsorship is still **not** implemented, and is a product decision rather than an
+implementation detail: it would put a spending key in this service.
 
 ## Why `POST /api/v1/groups` exists and does not create a group
 

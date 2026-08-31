@@ -12,6 +12,7 @@ import { createRegistrationStore, type RegistrationStore } from './db/registrati
 import { createNotificationReadModel, type NotificationReadModel } from './db/notifications';
 import { createTransactionReadModel, type TransactionReadModel } from './db/transactions';
 import { createNonceIssuer, type NonceIssuer } from './lib/nonce';
+import { createSorobanSimulator, type SorobanSimulator } from './lib/soroban';
 import { getDb } from './db/client';
 import { createRequireAuth } from './auth/guard';
 import { createTokenVerifier, type TokenVerifier } from './auth/verify';
@@ -47,6 +48,7 @@ export type BuildServerOptions = {
   registrations?: RegistrationStore;
   notificationReadModel?: NotificationReadModel;
   transactionReadModel?: TransactionReadModel;
+  sorobanSimulator?: SorobanSimulator;
 };
 
 /**
@@ -174,11 +176,21 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     readModel: options.notificationReadModel ?? createNotificationReadModel(getDb()),
   });
 
-  // Public and read-only, like the group routes: a transaction's events are on
-  // the ledger already, so there is nothing here to authorise.
+  // Public reads, plus the one authenticated preparation route: a transaction's
+  // events are on the ledger already, but simulating an envelope spends this
+  // service's RPC quota, so that one requires a session.
   await app.register(transactionRoutes, {
     prefix: '/api/v1',
+    requireAuth,
     readModel: options.transactionReadModel ?? createTransactionReadModel(getDb()),
+    simulate: options.sorobanSimulator ?? createSorobanSimulator(env.STELLAR_RPC_URL),
+    networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE,
+    // The Factory, or a group the index knows or that was registered after its
+    // creation confirmed. Without this, prepare would be an open simulation proxy
+    // for anyone with a session.
+    isAllowedContract: async (contractId) =>
+      (env.FACTORY_CONTRACT_ID !== '' && contractId === env.FACTORY_CONTRACT_ID) ||
+      (await isKnownGroup(contractId)),
   });
 
   app.setNotFoundHandler(async (_request, reply) => {
