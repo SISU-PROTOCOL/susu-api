@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Pushes occasionally do not produce a workflow run — it has happened here, with
+  # no path filter and no skip directive to explain it — and without this the only
+  # remedies are an empty commit or a force push. A manual trigger is the honest
+  # one, and it is also how a maintainer re-runs the full set after an
+  # infrastructure failure without pretending something changed.
+  workflow_dispatch:
 
 permissions:
   contents: read
