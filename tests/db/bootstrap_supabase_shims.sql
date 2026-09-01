@@ -87,3 +87,108 @@ begin
   raise notice 'Supabase shims ready: roles, auth.users, auth.uid().';
 end
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Storage, as far as this project's migrations touch it.
+--
+-- The avatar bucket and its policies live in `storage`, which a hosted project
+-- supplies and plain PostgreSQL does not. Without a model of it, the migration
+-- that creates `profile-images` would take its "storage is not installed" branch
+-- on every CI run, and the policies that are the entire access control for a
+-- user's photo would never be executed by a test. That is the same reasoning as
+-- the `auth` shim above: the guard has to be able to fail.
+--
+-- Only the columns the policies and their tests read are modelled. `foldername`
+-- and `filename` are reimplemented with Supabase's semantics — the path split on
+-- `/`, dropping the last segment — because a policy written against a different
+-- notion of "folder" would pass here and deny in production. Both are created
+-- only if absent, so this file remains a no-op against a real project rather
+-- than a replacement for Storage's own functions.
+-- ---------------------------------------------------------------------------
+create schema if not exists storage;
+
+create table if not exists storage.buckets (
+  id text primary key,
+  name text not null,
+  owner uuid,
+  public boolean default false not null,
+  file_size_limit bigint,
+  allowed_mime_types text[],
+  created_at timestamp with time zone default now() not null,
+  updated_at timestamp with time zone default now() not null
+);
+
+create table if not exists storage.objects (
+  id uuid primary key default gen_random_uuid(),
+  bucket_id text not null references storage.buckets (id),
+  name text not null,
+  owner uuid,
+  created_at timestamp with time zone default now() not null,
+  updated_at timestamp with time zone default now() not null,
+  unique (bucket_id, name)
+);
+
+-- Matches Supabase: every object is denied until a policy allows it.
+alter table storage.objects enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'storage' and p.proname = 'foldername'
+  ) then
+    execute $fn$
+      create function storage.foldername(name text)
+      returns text[]
+      language plpgsql
+      immutable
+      as $body$
+      declare
+        parts text[];
+      begin
+        parts := string_to_array(name, '/');
+        return parts[1 : array_length(parts, 1) - 1];
+      end;
+      $body$
+    $fn$;
+  end if;
+
+  if not exists (
+    select 1 from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'storage' and p.proname = 'filename'
+  ) then
+    execute $fn$
+      create function storage.filename(name text)
+      returns text
+      language plpgsql
+      immutable
+      as $body$
+      declare
+        parts text[];
+      begin
+        parts := string_to_array(name, '/');
+        return parts[array_length(parts, 1)];
+      end;
+      $body$
+    $fn$;
+  end if;
+end
+$$;
+
+grant usage on schema storage to anon, authenticated, service_role;
+
+-- Hosted Supabase grants the browser roles broad table privileges on
+-- `storage.objects` and relies on RLS alone to deny: the platform's own policies
+-- are the control, and a missing grant would deny for a reason that has nothing
+-- to do with this project's policies. Mirroring that here keeps the guard
+-- honest — a denial in CI is a policy denial, as it would be in production.
+grant all on storage.objects to anon, authenticated, service_role;
+grant select on storage.buckets to service_role;
+
+do $$
+begin
+  raise notice 'Supabase storage shims ready: buckets, objects, foldername, filename.';
+end
+$$;

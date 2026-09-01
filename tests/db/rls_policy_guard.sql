@@ -41,6 +41,11 @@
 \set group_contract_id '''CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'''
 \set account_address '''GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'''
 
+-- Two avatar objects, one per user, in the shape the app produces: a generated
+-- 32-character hex name under the user's own prefix.
+\set avatar_one '''users/11111111-1111-1111-1111-111111111111/avatar/11111111111111111111111111111111.png'''
+\set avatar_two '''users/22222222-2222-2222-2222-222222222222/avatar/22222222222222222222222222222222.png'''
+
 -- ---------------------------------------------------------------------------
 -- Fixtures.
 --
@@ -956,11 +961,242 @@ $$;
 reset role;
 
 -- ---------------------------------------------------------------------------
+-- 8h. Profile images: one private bucket, and objects reachable only by their
+--     owner.
+--
+--     The bucket is checked first, and the table privileges are asserted before
+--     any denial. The ordering is deliberate: a hosted project grants `anon` and
+--     `authenticated` broad privileges on `storage.objects` and relies on RLS
+--     alone, so a denial here is a policy denial. If the grant were missing the
+--     same denial would appear from the wrong cause, and the guard would pass
+--     while the policies said anything at all.
+-- ---------------------------------------------------------------------------
+do $$
+declare problem text;
+begin
+  select case
+           when b.public is not false then 'the bucket is public'
+           when coalesce(b.file_size_limit, 0) <> 2097152 then 'the size limit is not 2 MiB'
+           when not (b.allowed_mime_types @> array['image/png', 'image/jpeg', 'image/webp'])
+             then 'the MIME allow-list does not contain the three image types'
+           else null
+         end
+    into problem
+  from storage.buckets b
+  where b.id = 'profile-images';
+
+  if not found then
+    raise exception 'the profile-images bucket does not exist, so no profile image can be stored';
+  end if;
+  if problem is not null then
+    raise exception 'profile-images: %', problem;
+  end if;
+  raise notice 'ok: profile-images is private, capped at 2 MiB, and limited to three image types';
+end
+$$;
+
+do $$
+begin
+  if not has_table_privilege('authenticated', 'storage.objects', 'INSERT')
+     or not has_table_privilege('authenticated', 'storage.objects', 'SELECT')
+     or not has_table_privilege('anon', 'storage.objects', 'SELECT') then
+    raise exception
+      'storage.objects privileges are narrower than a hosted project grants, so the denials below would not be policy denials';
+  end if;
+  raise notice 'ok: storage.objects grants are broad, as on a hosted project';
+end
+$$;
+
+-- Two objects, one per user, written by the connecting role so that both exist
+-- for the cross-user assertions.
+insert into storage.objects (bucket_id, name) values
+  ('profile-images', :avatar_one),
+  ('profile-images', :avatar_two)
+on conflict (bucket_id, name) do nothing;
+
+select set_config('guard.avatar_one', :avatar_one, false),
+       set_config('guard.avatar_two', :avatar_two, false);
+
+select set_config('request.jwt.claim.sub', '', false);
+set role anon;
+
+do $$
+declare listed int; refused boolean := false;
+begin
+  select count(*) into listed from storage.objects;
+  if listed <> 0 then
+    raise exception 'anon can list % storage object(s)', listed;
+  end if;
+
+  begin
+    insert into storage.objects (bucket_id, name)
+    values ('profile-images', current_setting('guard.avatar_one'));
+  exception when insufficient_privilege then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception 'anon uploaded a profile image';
+  end if;
+  raise notice 'ok: anon can neither list nor upload a profile image';
+end
+$$;
+
+reset role;
+select set_config('request.jwt.claim.sub', :user_one, false);
+set role authenticated;
+
+do $$
+declare mine int; theirs int;
+begin
+  -- Their own object, and only it. `theirs` is read by exact name, so this is a
+  -- statement about RLS rather than about not being able to guess a path.
+  select count(*) into mine from storage.objects where name = current_setting('guard.avatar_one');
+  select count(*) into theirs from storage.objects where name = current_setting('guard.avatar_two');
+
+  if mine <> 1 then
+    raise exception 'a user could not read their own profile image';
+  end if;
+  if theirs <> 0 then
+    raise exception 'a user can read another user''s profile image';
+  end if;
+  raise notice 'ok: a user reads their own profile image and not another user''s';
+end
+$$;
+
+do $$
+declare refused boolean := false;
+begin
+  -- Writing under someone else's prefix. The `with check` clause is what refuses
+  -- this; without it the insert would be permitted and the object would land in
+  -- a folder its owner cannot reach.
+  begin
+    insert into storage.objects (bucket_id, name)
+    values ('profile-images', 'users/22222222-2222-2222-2222-222222222222/avatar/33333333333333333333333333333333.png');
+  exception when insufficient_privilege then
+    refused := true;
+  end;
+
+  if not refused then
+    raise exception 'a user uploaded into another user''s prefix';
+  end if;
+  raise notice 'ok: a user cannot upload into another user''s prefix';
+end
+$$;
+
+do $$
+declare removed int; moved int;
+begin
+  -- Deleting and renaming someone else's object affect zero rows rather than
+  -- raising, because RLS filters the rows a statement may see.
+  delete from storage.objects where name = current_setting('guard.avatar_two');
+  get diagnostics removed = row_count;
+
+  update storage.objects set name = 'users/11111111-1111-1111-1111-111111111111/avatar/44444444444444444444444444444444.png'
+  where name = current_setting('guard.avatar_two');
+  get diagnostics moved = row_count;
+
+  if removed <> 0 or moved <> 0 then
+    raise exception 'a user reached another user''s object (deleted %, renamed %)', removed, moved;
+  end if;
+  raise notice 'ok: a user cannot delete or rename another user''s object';
+end
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 8i. `avatar_path` may only name the user's own object, in the shape this app
+--     produces. The column is writable by the browser, so this is the check that
+--     cannot be bypassed by a second writer or a future endpoint that forgot to
+--     validate.
+-- ---------------------------------------------------------------------------
+begin;
+
+select set_config('request.jwt.claim.sub', :user_one, false);
+set role authenticated;
+
+do $$
+declare accepted int;
+begin
+  update public.profiles
+  set avatar_path = 'users/11111111-1111-1111-1111-111111111111/avatar/55555555555555555555555555555555.webp'
+  where user_id = '11111111-1111-1111-1111-111111111111';
+  get diagnostics accepted = row_count;
+
+  if accepted <> 1 then
+    raise exception 'a user could not set their own avatar path';
+  end if;
+  raise notice 'ok: a user sets an avatar path in their own prefix';
+end
+$$;
+
+do $$
+declare
+  names text[] := array[
+    -- A name the uploader chose rather than one this app generated.
+    'users/11111111-1111-1111-1111-111111111111/avatar/photo.png',
+    -- A format the bucket does not accept.
+    'users/11111111-1111-1111-1111-111111111111/avatar/66666666666666666666666666666666.gif',
+    -- Another user's prefix: an object this user can neither read nor delete.
+    'users/22222222-2222-2222-2222-222222222222/avatar/77777777777777777777777777777777.png',
+    -- Traversal, which would resolve outside the prefix the policies match on.
+    'users/11111111-1111-1111-1111-111111111111/avatar/../../22222222-2222-2222-2222-222222222222/avatar/88888888888888888888888888888888.png',
+    -- An absolute URL, which is the mistake this column exists to prevent.
+    'https://example.com/photo.png'
+  ];
+  candidate text;
+  refused boolean;
+begin
+  foreach candidate in array names loop
+    refused := false;
+    begin
+      update public.profiles
+      set avatar_path = candidate
+      where user_id = '11111111-1111-1111-1111-111111111111';
+    exception when check_violation then
+      refused := true;
+    end;
+
+    if not refused then
+      raise exception 'avatar_path accepted %', candidate;
+    end if;
+  end loop;
+  raise notice 'ok: avatar_path refuses names it did not generate, other users'' prefixes, and traversal';
+end
+$$;
+
+rollback;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 8j. The server path reaches the bucket as well: cleaning up a deleted
+--     account's photo is the API's job, because the browser of a deleted account
+--     no longer exists to do it.
+-- ---------------------------------------------------------------------------
+set role service_role;
+
+do $$
+declare n int;
+begin
+  select count(*) into n from storage.objects where bucket_id = 'profile-images';
+  if n < 2 then
+    raise exception 'service_role saw % profile image(s); the server could not clean them up', n;
+  end if;
+  raise notice 'ok: service_role reaches profile images';
+end
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
 -- Clean up. The mutating assertion was rolled back, so only the fixtures
 -- remain. Removing them here keeps the guard re-runnable and leaves a shared
 -- test database as it was found.
 -- ---------------------------------------------------------------------------
 delete from public.group_registrations where registered_by in (:user_one, :user_two);
+delete from storage.objects where name in (:avatar_one, :avatar_two);
 delete from public.invite_redemptions
   where invite_id in (select id from public.invite_links where created_by in (:user_one, :user_two));
 delete from public.wallet_link_nonces where user_id in (:user_one, :user_two);
