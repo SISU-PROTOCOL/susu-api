@@ -22,6 +22,19 @@ type GetUserResult = {
   error: { message: string } | null;
 };
 
+/** One entry as Storage's list endpoint returns it. Only the name is needed. */
+type StorageObjectEntry = { name: string };
+
+type StorageListResult = {
+  data: StorageObjectEntry[] | null;
+  error: { message: string } | null;
+};
+
+type StorageRemoveResult = {
+  data: { name: string }[] | null;
+  error: { message: string } | null;
+};
+
 /** The slice of the admin client this service uses. */
 export type SupabaseAdminClient = {
   auth: {
@@ -30,7 +43,16 @@ export type SupabaseAdminClient = {
       deleteUser(userId: string): Promise<{ error: { message: string } | null }>;
     };
   };
+  storage: {
+    from(bucket: string): {
+      list(path: string, options?: { limit?: number }): Promise<StorageListResult>;
+      remove(paths: string[]): Promise<StorageRemoveResult>;
+    };
+  };
 };
+
+/** The bucket profile photos live in. Kept beside the deleter that empties it. */
+export const PROFILE_IMAGE_BUCKET = 'profile-images';
 
 export function createSupabaseAdminClient(
   supabaseUrl: string,
@@ -50,14 +72,87 @@ export function createSupabaseAdminClient(
  * cascade can reach chain history, because chain-derived rows are keyed by
  * wallet and contract address rather than by user id.
  *
- * A failure is reported as a value so the route can answer 502 — the caller is
- * authenticated and their retry may succeed — instead of degrading into a
- * generic 500.
+ * THE PHOTO IS NOT REACHABLE BY THAT CASCADE. A Storage object is a row in
+ * `storage.objects` plus a blob behind the Storage API; the blob is removed by
+ * the API, not by a foreign key, so the objects are deleted here — before the
+ * account, and through the same service-role client.
+ *
+ * ORDER, AND WHAT FAILURE MEANS
+ * The photo is removed first, and a failure there does not stop the account
+ * deletion. That ordering is deliberate: the account is the thing the user asked
+ * to destroy, and refusing to destroy it because a blob would not delete would
+ * make the requested operation fail for a reason the user cannot act on. The
+ * cost of the reverse order is the opposite and worse: an account gone while its
+ * photo remains.
+ *
+ * A failed cleanup is reported to the caller's logger and otherwise ignored. The
+ * object that survives is still private — the only policy that could read it was
+ * the owner's, and the owner no longer exists — so this is untidy rather than
+ * exposed, and it is recorded rather than silently swallowed.
+ *
+ * A failure of the account deletion itself is reported as a value so the route
+ * can answer 502 — the caller is authenticated and their retry may succeed —
+ * instead of degrading into a generic 500.
  */
 export type AccountDeleter = (userId: string) => Promise<boolean>;
 
-export function createAccountDeleter(client: SupabaseAdminClient): AccountDeleter {
+export type AccountDeleterOptions = {
+  /**
+   * Where a cleanup that did not finish is reported.
+   *
+   * Injected rather than logged here so this module keeps no opinion about
+   * logging, and so a test can assert the warning was raised.
+   */
+  readonly onWarning?: (message: string) => void;
+  readonly bucket?: string;
+};
+
+/**
+ * The largest number of avatar objects one account can have.
+ *
+ * The app keeps one photo per user: it removes the previous object when it
+ * replaces one. The list call is bounded anyway, so a client that somehow
+ * accumulated objects cannot turn account deletion into an unbounded scan.
+ */
+const AVATAR_LIST_LIMIT = 100;
+
+async function removeProfileImages(
+  client: SupabaseAdminClient,
+  bucket: string,
+  userId: string,
+  onWarning: (message: string) => void,
+): Promise<void> {
+  const prefix = `users/${userId}/avatar`;
+
+  const listing = await client.storage.from(bucket).list(prefix, { limit: AVATAR_LIST_LIMIT });
+  if (listing.error !== null || listing.data === null) {
+    onWarning(
+      `profile image cleanup could not list ${prefix}: ${listing.error?.message ?? 'no data'}`,
+    );
+    return;
+  }
+
+  const paths = listing.data.map((entry) => `${prefix}/${entry.name}`);
+  if (paths.length === 0) return;
+
+  const removed = await client.storage.from(bucket).remove(paths);
+  if (removed.error !== null) {
+    onWarning(
+      `profile image cleanup left ${paths.length} object(s) in ${bucket}: ${removed.error.message}`,
+    );
+  }
+}
+
+export function createAccountDeleter(
+  client: SupabaseAdminClient,
+  options: AccountDeleterOptions = {},
+): AccountDeleter {
+  const bucket = options.bucket ?? PROFILE_IMAGE_BUCKET;
+  const onWarning = options.onWarning ?? ((): void => {});
+
   return async (userId: string): Promise<boolean> => {
+    await removeProfileImages(client, bucket, userId, onWarning);
+
     const { error } = await client.auth.admin.deleteUser(userId);
     return error === null;
   };
