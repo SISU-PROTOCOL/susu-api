@@ -12,7 +12,9 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { authenticatedUser } from '../auth/guard';
+import type { MemberActivityRecord } from '../db/groups';
 import type { AccountReadModel, ProfileChanges } from '../db/me';
+import { envelope, paginationFields, type Page, type PageResult } from '../lib/pagination';
 import type { AccountDeleter } from '../supabase/admin';
 import { invalidRequest } from './errors';
 
@@ -22,6 +24,14 @@ export type MeRoutesOptions = {
   accountReadModel: AccountReadModel;
   requireAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   deleteAccount: AccountDeleter;
+  /**
+   * The caller's chain activity, across every group their wallet is in.
+   *
+   * Injected as one function rather than the whole group read model: this route
+   * needs exactly this question answered, and passing the model would hand the
+   * account surface the ability to read any group it liked.
+   */
+  listMemberActivity: (address: string, page: Page) => Promise<PageResult<MemberActivityRecord>>;
 };
 
 /**
@@ -78,8 +88,11 @@ const deleteBody = z.object({
   }),
 });
 
+/** The `limit`/`offset` pair for the activity feed, validated like every other list. */
+const pageQuery = z.object(paginationFields);
+
 export async function meRoutes(app: FastifyInstance, options: MeRoutesOptions): Promise<void> {
-  const { accountReadModel, requireAuth, deleteAccount } = options;
+  const { accountReadModel, requireAuth, deleteAccount, listMemberActivity } = options;
 
   app.get('/me', { preHandler: requireAuth }, async (request, reply) => {
     const user = authenticatedUser(request);
@@ -105,6 +118,45 @@ export async function meRoutes(app: FastifyInstance, options: MeRoutesOptions): 
 
     reply.header('cache-control', NO_STORE);
     return reply.send({ data: account });
+  });
+
+  /**
+   * The signed-in user's activity feed.
+   *
+   * WHY IT IS UNDER /me RATHER THAN A NEW SURFACE
+   * The answer depends on who is asking — it is every event from every group the
+   * caller's wallet belongs to — so it is an account-scoped read, and it belongs
+   * with the other account-scoped reads. The group's own activity list still
+   * exists for the case where a client already knows which group it is looking
+   * at, and the two answer different questions.
+   *
+   * NO_WALLET IS AN EMPTY FEED, NOT AN ERROR
+   * Membership is what makes an event reachable here, and membership is by
+   * wallet. A caller who has not linked one is in no group, so they have no feed;
+   * answering `200` with nothing is that truth. Inventing an error would push a
+   * state the client can already read from `GET /me` — where `walletAddress` is
+   * `null` — into an error path it would have to translate.
+   *
+   * Not cached, like the rest of this surface: the URL is the same for every
+   * caller, and the response is not.
+   */
+  app.get('/me/activity', { preHandler: requireAuth }, async (request, reply) => {
+    const parsed = pageQuery.safeParse(request.query);
+    if (!parsed.success) return invalidRequest(reply, parsed.error);
+
+    const user = authenticatedUser(request);
+    const account = await accountReadModel.getAccount(user.id);
+
+    reply.header('cache-control', NO_STORE);
+
+    if (account.walletAddress === null) {
+      return reply.send(
+        envelope({ items: [], hasMore: false }, parsed.data.limit, parsed.data.offset),
+      );
+    }
+
+    const result = await listMemberActivity(account.walletAddress, parsed.data);
+    return reply.send(envelope(result, parsed.data.limit, parsed.data.offset));
   });
 
   app.delete('/me', { preHandler: requireAuth }, async (request, reply) => {

@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import type { GroupReadModel, MemberActivityRecord } from '../src/db/groups';
 import type { AccountReadModel, AccountView, ProfileChanges } from '../src/db/me';
 import type { TokenVerifier } from '../src/auth/verify';
 import { configureTestEnv } from './support/fixtures';
@@ -8,6 +9,9 @@ configureTestEnv();
 
 const USER_ID = '11111111-1111-1111-1111-111111111111';
 const OTHER_ID = '22222222-2222-2222-2222-222222222222';
+const WALLET = 'GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD';
+const OTHER_WALLET = 'GEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE';
+const GROUP = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 
 const AUTH = { authorization: 'Bearer a-good-token' };
 
@@ -35,9 +39,9 @@ type FakeReadModel = AccountReadModel & {
   updateProfile: ReturnType<typeof vi.fn>;
 };
 
-function fakeAccountReadModel(): FakeReadModel {
+function fakeAccountReadModel(walletAddress: string | null = null): FakeReadModel {
   return {
-    getAccount: vi.fn(async (userId: string) => accountView({ userId })),
+    getAccount: vi.fn(async (userId: string) => accountView({ userId, walletAddress })),
     updateProfile: vi.fn(async (userId: string, changes: ProfileChanges) =>
       accountView({
         userId,
@@ -48,19 +52,39 @@ function fakeAccountReadModel(): FakeReadModel {
   } as unknown as FakeReadModel;
 }
 
+type FakeGroupReadModel = {
+  listMemberActivity: ReturnType<typeof vi.fn>;
+  groupExists: ReturnType<typeof vi.fn>;
+};
+
+function fakeGroupReadModel(activity: readonly MemberActivityRecord[] = []): FakeGroupReadModel {
+  return {
+    listMemberActivity: vi.fn(async () => ({ items: activity, hasMore: false })),
+    groupExists: vi.fn(async () => false),
+  };
+}
+
 type Harness = {
   app: FastifyInstance;
   readModel: FakeReadModel;
+  groups: FakeGroupReadModel;
   deleteAccount: ReturnType<typeof vi.fn>;
   verify: ReturnType<typeof vi.fn>;
 };
 
 async function harness(
-  options: { deleteSucceeds?: boolean; verify?: TokenVerifier; describeToken?: boolean } = {},
+  options: {
+    deleteSucceeds?: boolean;
+    verify?: TokenVerifier;
+    describeToken?: boolean;
+    walletAddress?: string | null;
+    activity?: readonly MemberActivityRecord[];
+  } = {},
 ): Promise<Harness> {
   const { buildServer } = await import('../src/server');
 
-  const readModel = fakeAccountReadModel();
+  const readModel = fakeAccountReadModel(options.walletAddress ?? null);
+  const groups = fakeGroupReadModel(options.activity);
   const deleteAccount = vi.fn(async () => options.deleteSucceeds ?? true);
   // Defaults to accepting, and resolving to a specific user, so the tests that
   // care about identity are asserting on the id rather than on the auth path.
@@ -69,12 +93,13 @@ async function harness(
   const app = await buildServer({
     probeDatabase: async () => {},
     accountReadModel: readModel,
+    readModel: groups as unknown as GroupReadModel,
     deleteAccount,
     verifyToken: (options.verify ?? verify) as TokenVerifier,
   });
   built.push(app);
 
-  return { app, readModel, deleteAccount, verify };
+  return { app, readModel, groups, deleteAccount, verify };
 }
 
 describe('GET /api/v1/me', () => {
@@ -114,6 +139,126 @@ describe('GET /api/v1/me', () => {
   it('forbids caching account data', async () => {
     const { app } = await harness();
     const response = await app.inject({ method: 'GET', url: '/api/v1/me', headers: AUTH });
+
+    expect(response.headers['cache-control']).toBe('no-store');
+  });
+});
+
+describe('GET /api/v1/me/activity', () => {
+  const event = (overrides: Partial<MemberActivityRecord> = {}): MemberActivityRecord => ({
+    contractId: GROUP,
+    eventIdentity: 'evt-1',
+    name: 'contribution_made',
+    ledger: 42,
+    txIndex: 0,
+    eventIndex: 0,
+    txHash: 'a'.repeat(64),
+    payload: { amount: '5000000' },
+    ...overrides,
+  });
+
+  it('refuses an unauthenticated request without reading anything', async () => {
+    const { app, groups } = await harness({ walletAddress: WALLET });
+
+    const response = await app.inject({ method: 'GET', url: '/api/v1/me/activity' });
+
+    expect(response.statusCode).toBe(401);
+    expect(groups.listMemberActivity).not.toHaveBeenCalled();
+  });
+
+  it('reads the feed for the wallet the token is linked to', async () => {
+    const { app, groups } = await harness({ walletAddress: WALLET });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity',
+      headers: AUTH,
+    });
+
+    expect(response.statusCode).toBe(200);
+    // The address comes from the account model, which is keyed by the verified
+    // token's subject — never from a parameter the caller controls.
+    expect(groups.listMemberActivity).toHaveBeenCalledWith(WALLET, { limit: 20, offset: 0 });
+  });
+
+  it('ignores an address supplied in the query string', async () => {
+    const { app, groups } = await harness({ walletAddress: WALLET });
+
+    await app.inject({
+      method: 'GET',
+      url: `/api/v1/me/activity?member=${OTHER_WALLET}&address=${OTHER_WALLET}`,
+      headers: AUTH,
+    });
+
+    expect(groups.listMemberActivity).toHaveBeenCalledWith(WALLET, expect.anything());
+  });
+
+  it('answers an account with no linked wallet with an empty feed', async () => {
+    // Membership is by wallet, so an unlinked account is in no group. That is an
+    // answer, not a failure: the client reads `walletAddress` from GET /me to
+    // explain it, rather than translating an error it did not need.
+    const { app, groups } = await harness({ walletAddress: null });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity',
+      headers: AUTH,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      data: [],
+      page: { limit: 20, offset: 0, hasMore: false },
+    });
+    expect(groups.listMemberActivity).not.toHaveBeenCalled();
+  });
+
+  it('returns events with the group they came from', async () => {
+    const { app } = await harness({ walletAddress: WALLET, activity: [event()] });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity',
+      headers: AUTH,
+    });
+
+    expect(response.json().data).toEqual([event()]);
+  });
+
+  it('passes paging through and reports it', async () => {
+    const { app, groups } = await harness({ walletAddress: WALLET });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity?limit=5&offset=10',
+      headers: AUTH,
+    });
+
+    expect(groups.listMemberActivity).toHaveBeenCalledWith(WALLET, { limit: 5, offset: 10 });
+    expect(response.json().page).toEqual({ limit: 5, offset: 10, hasMore: false });
+  });
+
+  it('refuses a page size beyond the ceiling', async () => {
+    const { app, groups } = await harness({ walletAddress: WALLET });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity?limit=1000',
+      headers: AUTH,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(groups.listMemberActivity).not.toHaveBeenCalled();
+  });
+
+  it('forbids caching a feed that depends on who is asking', async () => {
+    const { app } = await harness({ walletAddress: WALLET });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/v1/me/activity',
+      headers: AUTH,
+    });
 
     expect(response.headers['cache-control']).toBe('no-store');
   });
