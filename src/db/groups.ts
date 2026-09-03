@@ -111,6 +111,18 @@ export type ActivityRecord = {
   readonly payload: unknown;
 };
 
+/**
+ * One event, with the group it belongs to.
+ *
+ * A member's feed spans groups, so a row that did not carry its contract id
+ * could not be linked back to anything. The per-group activity list does not
+ * need it — it was asked for one contract — which is why this is a separate
+ * type rather than an extra field on `ActivityRecord`.
+ */
+export type MemberActivityRecord = ActivityRecord & {
+  readonly contractId: string;
+};
+
 export type ListGroupsQuery = {
   readonly status?: GroupStatus;
   readonly creator?: string;
@@ -131,6 +143,14 @@ export type GroupReadModel = {
   listContributions(contractId: string, page: Page): Promise<PageResult<ContributionRecord>>;
   listPayouts(contractId: string, page: Page): Promise<PageResult<PayoutRecord>>;
   listActivity(contractId: string, page: Page): Promise<PageResult<ActivityRecord>>;
+  /**
+   * Every decoded event from every group this address has joined, newest first.
+   *
+   * This is the feed behind `/me/activity`. It is one query rather than one per
+   * group, so a member of twenty groups does not make twenty requests, and it is
+   * scoped by membership rather than by a parameter the caller supplies.
+   */
+  listMemberActivity(address: string, page: Page): Promise<PageResult<MemberActivityRecord>>;
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +218,10 @@ type ActivityRow = {
   event_index: number | string;
   tx_hash: string;
   payload: unknown;
+};
+
+type MemberActivityRow = ActivityRow & {
+  contract_id: string;
 };
 
 /**
@@ -287,6 +311,10 @@ function toActivity(row: ActivityRow): ActivityRecord {
     txHash: row.tx_hash,
     payload: row.payload,
   };
+}
+
+function toMemberActivity(row: MemberActivityRow): MemberActivityRecord {
+  return { contractId: row.contract_id, ...toActivity(row) };
 }
 
 /** The columns every group query selects, so the shape cannot drift between them. */
@@ -453,6 +481,48 @@ export function createGroupReadModel(db: NodePgDatabase<typeof schema>): GroupRe
       `);
 
       return paginate((rows as ActivityRow[]).map(toActivity), page.limit);
+    },
+
+    /**
+     * The signed-in member's feed: activity from every group they are in.
+     *
+     * ORDER IS THE OPPOSITE OF THE AUDIT TRAIL, deliberately. A group's own
+     * activity list is read oldest-first because it is a record of how the group
+     * got where it is. A feed is read newest-first, because the question it
+     * answers is "what just happened" rather than "how did we get here".
+     *
+     * Scoping is by membership, matched in SQL against the address the caller's
+     * session is bound to — never against a parameter. An address that is in no
+     * group returns an empty page rather than an error: having no wallet linked
+     * and being in no group are the same answer to this question.
+     *
+     * The membership test is a semi-join, which the indexer's
+     * `group_members_member_idx` supports; the events then come from
+     * `decoded_events_contract_ledger_idx`. `order by` across several contracts
+     * is a sort, and that is the cost of a cross-group feed over a per-group
+     * index — the alternative is a denormalised feed table, which would be a
+     * second copy of chain data to keep honest.
+     */
+    async listMemberActivity(address, page) {
+      const rows = await queryRows(sql`
+        select
+          e.contract_id,
+          e.event_identity,
+          e.name,
+          e.ledger,
+          e.tx_index,
+          e.event_index,
+          e.tx_hash,
+          e.payload
+        from public.decoded_events e
+        where e.contract_id in (
+          select m.contract_id from public.group_members m where m.member = ${address}
+        )
+        order by e.ledger desc, e.tx_index desc, e.event_index desc
+        limit ${page.limit + 1} offset ${page.offset}
+      `);
+
+      return paginate((rows as MemberActivityRow[]).map(toMemberActivity), page.limit);
     },
   };
 }

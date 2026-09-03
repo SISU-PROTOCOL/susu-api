@@ -37,6 +37,7 @@ Node.js · TypeScript · Fastify · Zod · Drizzle ORM · PostgreSQL (Supabase) 
 | `POST` | `/api/v1/groups` | Records a group address the chain has just produced, for a bounded window. See below. |
 | `GET` | `/api/v1/transactions/:txHash` | The decoded receipt for one transaction. Public. |
 | `POST` | `/api/v1/transactions/prepare` | Simulates one contract invocation and returns it with a footprint and fee. Authenticated. See below. |
+| `GET` | `/api/v1/me/activity` | Every decoded event from every group the caller's wallet is in, newest first. Authenticated. See below. |
 
 Lists are paginated with `limit` (default 20, max 100) and `offset` (max 10000), and
 return `{ data, page: { limit, offset, hasMore } }`.
@@ -50,6 +51,52 @@ The account surface is `GET`, `PATCH` and `DELETE /api/v1/me`; wallet linking is
 (codes are opaque, so the client learns the group from the response) or
 `POST /api/v1/groups/:contractId/join` when the client already knows it; notifications are
 `GET /api/v1/notifications` and `POST /api/v1/notifications/:id/read`.
+
+## Why `GET /api/v1/me/activity` exists next to the per-group activity list
+
+A group's activity list answers "how did this group get here" and is read oldest-first. The
+feed answers "what just happened to me" and is read newest-first, across every group the
+caller's **linked wallet** belongs to. It is one query rather than one request per group,
+and membership is matched in SQL against the address the session is bound to — the caller
+cannot name an address, and an address in no group gets an empty page rather than an error.
+
+An account with no linked wallet gets an empty feed for the same reason: membership is by
+wallet, so there is provably nothing to show, and `GET /api/v1/me` already reports
+`walletAddress: null` for the client to explain it with.
+
+## Profile images, and who can touch them
+
+A user's photo lives in the private `profile-images` bucket, created and configured by
+migration (`drizzle/0004_profile_images.sql`) rather than by a dashboard click, so that
+`public = false`, the 2 MiB limit and the three accepted image types are reviewable and
+re-applied on every deploy.
+
+**The API never handles image bytes.** The browser uploads and deletes with the publishable
+key, under policies that match `(storage.foldername(name))[2]` — the `<uuid>` in
+`users/<uuid>/avatar/<name>` — against `auth.uid()`. It then tells `PATCH /api/v1/me` which
+object key it used, and what this service stores is a relative path, never a URL. Ownership
+comes from the session, never from a value in the request.
+
+**`avatar_path` is constrained, not merely validated.** The column is writable by the
+browser through column-level grants, while the runtime check lives here — so a `CHECK`
+constraint binds it to `users/<the row's own user_id>/avatar/<32 lowercase hex>.<png|jpg|jpeg|webp>`.
+That refusal is what stops a stored path pointing at another user's object, at a
+user-chosen name, or at a traversal. The runtime check gives the error message; the
+constraint is the part that cannot be bypassed by a second writer.
+
+**There is no cross-user read policy.** A user can read, replace and delete their own
+object and no one else's. Showing one member's photo to another would need a policy that
+joins to group membership — a decision about what group data means rather than about who
+owns an object — so it is not made here, and the app must not render other members'
+avatars until it is.
+
+**Deleting an account takes the photo with it.** The auth cascade reaches this service's
+tables but cannot reach a Storage blob, so `DELETE /api/v1/me` empties `users/<id>/avatar/`
+first and then deletes the account. A cleanup that fails is logged and does not block the
+deletion: the account is what the user asked to destroy, and an object whose only reader
+has just been deleted is untidy rather than exposed. What deletion does **not** reach is
+chain history — contributions and payouts are keyed by wallet and contract address, never
+by user id.
 
 ## Why `POST /api/v1/transactions/prepare` exists and cannot move money
 

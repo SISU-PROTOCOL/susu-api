@@ -100,7 +100,22 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   // never touch Supabase.
   const supabase = createSupabaseAdminClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
   const verifyToken = options.verifyToken ?? createTokenVerifier(supabase);
-  const deleteAccount = options.deleteAccount ?? createAccountDeleter(supabase);
+  const deleteAccount =
+    options.deleteAccount ??
+    createAccountDeleter(supabase, {
+      // A profile photo that outlived its account is untidy, not exposed — the
+      // only policy that could read it belonged to the deleted user — but it is
+      // still something an operator should be able to see in the logs rather
+      // than discover on a storage bill.
+      onWarning: (message) => app.log.warn({ event: 'account_cleanup' }, message),
+    });
+
+  // Versioned application surface. `getDb()` builds a connection pool lazily, so
+  // constructing the read model opens no connection until the first query. One
+  // instance is shared by the public group routes, by the invite routes — which
+  // need it to tell "this group has nothing yet" from "there is no such group" —
+  // and by the account surface, whose activity feed is a question about groups.
+  const groupReadModel = options.readModel ?? createGroupReadModel(getDb());
 
   // Account routes are the authenticated surface: each declares `requireAuth`,
   // and identity comes from the verified token rather than from the request.
@@ -109,6 +124,9 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     accountReadModel: options.accountReadModel ?? createAccountReadModel(getDb()),
     requireAuth: createRequireAuth(verifyToken),
     deleteAccount,
+    // The feed is scoped by the caller's linked wallet, which the route reads
+    // from the account model. Nothing about the address comes from the request.
+    listMemberActivity: (address, page) => groupReadModel.listMemberActivity(address, page),
   });
 
   // Wallet linking is a two-step authenticated handshake. The nonce issuer holds
@@ -126,12 +144,6 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
         networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE,
       }),
   });
-
-  // Versioned application surface. `getDb()` builds a connection pool lazily, so
-  // constructing the read model opens no connection until the first query. One
-  // instance is shared by the public group routes and by the invite routes, which
-  // need it to tell "this group has nothing yet" from "there is no such group".
-  const groupReadModel = options.readModel ?? createGroupReadModel(getDb());
 
   // The registrations a creator makes when the indexer has not yet seen their
   // group. Shared by the route that records them and the invite gate that honours

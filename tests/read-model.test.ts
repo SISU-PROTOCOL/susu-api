@@ -210,3 +210,73 @@ describe('group existence', () => {
     expect(await createGroupReadModel(db).groupExists(GROUP_CONTRACT_ID)).toBe(true);
   });
 });
+
+describe('the member activity feed', () => {
+  const WALLET = `G${'D'.repeat(55)}`;
+
+  it('scopes the feed by membership in SQL, not in JavaScript', async () => {
+    const { db, execute } = stubDb([]);
+
+    await createGroupReadModel(db).listMemberActivity(WALLET, { limit: 20, offset: 0 });
+
+    const { sql, params } = renderedQuery(execute.mock.calls[0]?.[0]);
+    // The address is a bound parameter of a membership test inside the query.
+    // Filtering after the fact would mean reading other members' groups first,
+    // and would leave the page size applying to rows the caller may not see.
+    expect(sql).toContain('group_members');
+    expect(sql).toContain('m.member =');
+    expect(params).toContain(WALLET);
+  });
+
+  it('reads newest first, the opposite of a group audit trail', async () => {
+    const { db, execute } = stubDb([]);
+
+    await createGroupReadModel(db).listMemberActivity(WALLET, { limit: 20, offset: 0 });
+
+    const sql = rendered(execute.mock.calls[0]?.[0]);
+    expect(sql).toMatch(/order by e\.ledger desc/i);
+  });
+
+  it('carries the group each event came from', async () => {
+    const { db } = stubDb([
+      {
+        contract_id: GROUP_CONTRACT_ID,
+        event_identity: 'evt-1',
+        name: 'payout_executed',
+        ledger: 4_606_600,
+        tx_index: 2,
+        event_index: 0,
+        tx_hash: 'b'.repeat(64),
+        payload: { round: 2 },
+      },
+    ]);
+
+    const result = await createGroupReadModel(db).listMemberActivity(WALLET, {
+      limit: 20,
+      offset: 0,
+    });
+
+    expect(result.items).toEqual([
+      {
+        contractId: GROUP_CONTRACT_ID,
+        eventIdentity: 'evt-1',
+        name: 'payout_executed',
+        ledger: 4_606_600,
+        txIndex: 2,
+        eventIndex: 0,
+        txHash: 'b'.repeat(64),
+        payload: { round: 2 },
+      },
+    ]);
+  });
+
+  it('applies the page to a cross-group query too', async () => {
+    const { db, execute } = stubDb([]);
+
+    await createGroupReadModel(db).listMemberActivity(WALLET, { limit: 5, offset: 10 });
+
+    const { params } = renderedQuery(execute.mock.calls[0]?.[0]);
+    expect(params).toContain(6);
+    expect(params).toContain(10);
+  });
+});
