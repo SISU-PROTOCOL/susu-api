@@ -192,3 +192,87 @@ begin
   raise notice 'Supabase storage shims ready: buckets, objects, foldername, filename.';
 end
 $$;
+
+-- ---------------------------------------------------------------------------
+-- The chain-derived tables this service READS but does not own.
+--
+-- WHY A COPY OF ANOTHER REPOSITORY'S SCHEMA IS HERE
+-- `decoded_events`, `groups` and `group_members` are created by `susu-indexer`,
+-- and this service only ever reads them. Reading a table is still a dependency on
+-- its shape: the notification sweep joins `decoded_events` to `group_members` and
+-- matches wallet addresses against `decoded_events.payload`, so a column renamed
+-- over there is a broken query over here, and nothing else in this repository
+-- would notice.
+--
+-- The copy is here rather than read from the indexer's directory because
+-- `susu-api`'s CI checks out `susu-api` alone. A test that reached across the
+-- filesystem into a sibling repository would pass locally and fail in CI, which
+-- is the worst arrangement of the two.
+--
+-- WHAT THIS DOES AND DOES NOT BUY
+-- The constraint that matters — that the names, columns and types used by the
+-- sweep match — is exercised, because the test writes real rows through this
+-- schema. What it cannot do is detect a change made to the indexer's DDL without
+-- a matching change here. That gap is real, and the mitigation is that the
+-- dependency is small and named: only the three columns the sweep reads, of a
+-- table whose shape is deliberately stable because it is a record of decoded
+-- events. Definitions are copied verbatim from
+-- `susu-indexer/supabase/migrations/20260816000000_chain_derived.sql`, and
+-- `create if not exists` keeps this a no-op against a database that already has
+-- the real ones.
+-- ---------------------------------------------------------------------------
+create table if not exists public.decoded_events (
+  event_identity text primary key,
+  name text not null check (
+    name in (
+      'group_created', 'fee_updated', 'treasury_updated', 'pause_updated',
+      'join', 'start', 'contribution', 'payout', 'fee', 'completed'
+    )
+  ),
+  contract_id text not null,
+  ledger bigint not null check (ledger >= 0),
+  tx_hash text not null,
+  tx_index integer not null check (tx_index >= 0),
+  event_index integer not null check (event_index >= 0),
+  event_id text not null,
+  payload jsonb not null,
+  inserted_at timestamptz not null default now()
+);
+
+create table if not exists public.groups (
+  contract_id text primary key,
+  factory_contract_id text not null,
+  group_id bigint not null check (group_id > 0),
+  creator text not null,
+  token text not null,
+  contribution_amount numeric(39,0) not null check (contribution_amount > 0),
+  member_capacity integer not null check (member_capacity > 0),
+  created_ledger bigint not null check (created_ledger >= 0),
+  status text not null default 'open' check (status in ('open', 'active', 'completed')),
+  member_count integer not null default 0 check (member_count >= 0),
+  current_round integer not null default 0 check (current_round >= 0),
+  completed_rounds integer not null default 0 check (completed_rounds >= 0),
+  contributed_total numeric(39,0) not null default 0 check (contributed_total >= 0),
+  paid_out_total numeric(39,0) not null default 0 check (paid_out_total >= 0),
+  fee_total numeric(39,0) not null default 0 check (fee_total >= 0),
+  last_event_ledger bigint not null default 0 check (last_event_ledger >= 0),
+  discovered_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (factory_contract_id, group_id)
+);
+
+create table if not exists public.group_members (
+  contract_id text not null references public.groups (contract_id) on delete cascade,
+  member text not null,
+  position integer not null check (position > 0),
+  joined_ledger bigint not null check (joined_ledger >= 0),
+  event_identity text not null,
+  primary key (contract_id, member),
+  unique (contract_id, position)
+);
+
+do $$
+begin
+  raise notice 'Chain-derived shims ready: decoded_events, groups, group_members.';
+end
+$$;
