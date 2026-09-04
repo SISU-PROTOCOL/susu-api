@@ -260,12 +260,31 @@ export const notifications = pgTable(
     /** Null until the user has seen it. */
     readAt: timestamp('read_at', { withTimezone: true }),
 
+    /**
+     * The decoded event this was derived from, and the reason re-deriving is
+     * safe.
+     *
+     * A notification is not authored, it is derived, so the sweep that produces
+     * them is repeatable and *will* be repeated — after a gap in the schedule,
+     * or by an operator catching up. The unique index over
+     * `(user_id, kind, source_event_identity)` is what makes the second run a
+     * no-op rather than a duplicate: idempotency by identity, enforced by an
+     * index rather than by reading first and deciding second.
+     *
+     * Null for anything not derived from a chain event — an operator's message,
+     * or a future path that has no event behind it. Postgres treats nulls as
+     * distinct in a unique index, so those rows coexist freely.
+     */
+    sourceEventIdentity: text('source_event_identity'),
+
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     // The list endpoint is always "my notifications, newest first", so the index
-    // is on the pair rather than on either column alone.
+    // is on the pair rather than on either column alone. The unique index in the
+    // migration leads with `user_id` too, so it serves the same query.
     index('notifications_user_created_idx').on(table.userId, table.createdAt),
+    uniqueIndex('notifications_source_idx').on(table.userId, table.kind, table.sourceEventIdentity),
   ],
 );
 
