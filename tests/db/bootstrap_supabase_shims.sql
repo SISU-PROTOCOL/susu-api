@@ -271,6 +271,41 @@ create table if not exists public.group_members (
   unique (contract_id, position)
 );
 
+-- The access posture of the real tables, which is half of what they are.
+--
+-- RLS enabled with no policies, so access defaults to deny; the browser roles
+-- are revoked outright rather than left to a policy; and the service role gets
+-- exactly the statements the indexer and the API's server side issue.
+--
+-- This is copied rather than assumed for a reason the guards make concrete:
+-- `rls_enabled_guard.sql` checks every table in `public`, so a shim without RLS
+-- fails CI on a table this repository does not own. That is the guard working —
+-- the shim had made CI's database diverge from the deployed one, and the guard
+-- refused to let the divergence stand.
+alter table public.decoded_events enable row level security;
+alter table public.groups enable row level security;
+alter table public.group_members enable row level security;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    execute 'revoke all on public.decoded_events from anon';
+    execute 'revoke all on public.groups from anon';
+    execute 'revoke all on public.group_members from anon';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    execute 'revoke all on public.decoded_events from authenticated';
+    execute 'revoke all on public.groups from authenticated';
+    execute 'revoke all on public.group_members from authenticated';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'grant select, insert on public.decoded_events to service_role';
+    execute 'grant select, insert, update on public.groups to service_role';
+    execute 'grant select, insert, update on public.group_members to service_role';
+  end if;
+end
+$$;
+
 do $$
 begin
   raise notice 'Chain-derived shims ready: decoded_events, groups, group_members.';
