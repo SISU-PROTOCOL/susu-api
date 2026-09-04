@@ -64,6 +64,35 @@ An account with no linked wallet gets an empty feed for the same reason: members
 wallet, so there is provably nothing to show, and `GET /api/v1/me` already reports
 `walletAddress: null` for the client to explain it with.
 
+## Notifications, and who derives them
+
+A notification is not authored, it is **derived**: "your payout was confirmed" is a statement
+about one decoded chain event. The derivation is `public.derive_notifications()`, defined in
+`drizzle/0006_notification_schedule.sql` and scheduled with `pg_cron` to run every minute. It
+lives in SQL rather than here because it is one set-based statement and because Postgres can
+run it without this service being reachable or authenticated; `createNotificationSweeper` is a
+thin caller for triggering it from the application, not a second implementation.
+
+The chain has never heard of a user — it knows wallet addresses — so turning events into
+messages needs `wallet_links`. That is why the indexer does not do it: it writes the faithful
+record, and this is a separate step over the same source. **Notifications are therefore never
+authoritative.** A member who wants to know whether they were paid reads the contract; a
+notification that never arrived costs them a look rather than a fact.
+
+Every row carries the `event_identity` it came from, and
+`notifications_source_idx` is unique over `(user_id, kind, source_event_identity)`. So the
+sweep is **idempotent by identity** rather than by remembering how far it got: a missed run, a
+partial run and an operator catching up all produce the same rows, and two runs racing produce
+one notification. A watermark would have the opposite property — a stale one skips
+notifications silently, which is the failure nobody notices.
+
+Only events addressed to a person produce one: a `contribution` the member made, a `payout`
+they received, and their group `completed`. `fee` is the protocol paying itself, and
+`join`/`start` for other people are not news to anyone. Link a wallet *after* a payout and no
+notification is back-filled for it — deliberately, because back-filling would make a
+notification a historical record rather than a message about something that just happened, and
+the activity feed already answers the historical question.
+
 ## Profile images, and who can touch them
 
 A user's photo lives in the private `profile-images` bucket, created and configured by

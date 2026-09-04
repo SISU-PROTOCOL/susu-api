@@ -57,6 +57,8 @@ const MIGRATIONS = [
   'drizzle/0002_nonces_and_redemptions.sql',
   'drizzle/0003_group_registrations.sql',
   'drizzle/0004_profile_images.sql',
+  'drizzle/0005_notification_sources.sql',
+  'drizzle/0006_notification_schedule.sql',
 ] as const;
 
 export type TestDatabase = NodePgDatabase<typeof schema>;
