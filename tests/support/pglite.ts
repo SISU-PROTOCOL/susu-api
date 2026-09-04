@@ -29,10 +29,10 @@ const repoRoot = join(here, '..', '..');
  * `psql` meta-commands, which PGlite does not implement.
  *
  * Only the shim file uses them (`\set ON_ERROR_STOP`); the migrations are plain
- * SQL. Dropping the lines is safe here because the guard scripts that rely on
- * `ON_ERROR_STOP` are not run through this harness.
+ * SQL. Exported so the guard tests, which run `tests/db/*.sql` files written for
+ * `psql`, can drop the same lines rather than keeping a second copy of the rule.
  */
-function stripMetaCommands(sql: string): string {
+export function stripMetaCommands(sql: string): string {
   return sql
     .split('\n')
     .filter((line) => !/^\s*\\/.test(line))
