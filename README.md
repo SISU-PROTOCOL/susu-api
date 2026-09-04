@@ -280,6 +280,25 @@ without IPv6 must use the pooler:
 `postgresql://postgres.<ref>:<password>@aws-<n>-<region>.pooler.supabase.com:5432/postgres`.
 Local development against the Supabase CLI stack needs no TLS and is detected automatically.
 
+### Applying a migration to a hosted project
+
+`pnpm db:migrate` decides what to apply from `drizzle.__drizzle_migrations`, which records one
+row per migration it has run. A migration applied by hand — through the SQL editor, or by a
+targeted script while debugging — is **not** recorded, so the next `pnpm db:migrate` believes it
+is missing and replays it. The replay fails on the first `create table` that already exists, and
+the error names a statement from a migration that is in fact applied, which sends the reader
+looking in the wrong place.
+
+So when applying one by hand, record it in the same transaction. The hash is the SHA-256 of the
+file and `created_at` is the `when` value from `drizzle/meta/_journal.json`:
+
+```sql
+insert into drizzle.__drizzle_migrations (hash, created_at) values ('<sha256 of the .sql>', <when>);
+```
+
+`pnpm db:check` verifies the journal and the files agree; it cannot see the database, so the row
+above is the part only a person can get right.
+
 ## Development
 
 Requires Node ≥ 22 and pnpm.
