@@ -68,7 +68,8 @@ wallet, so there is provably nothing to show, and `GET /api/v1/me` already repor
 
 A notification is not authored, it is **derived**: "your payout was confirmed" is a statement
 about one decoded chain event. The derivation is `public.derive_notifications()`, defined in
-`drizzle/0006_notification_schedule.sql` and scheduled with `pg_cron` to run every minute. It
+`drizzle/0006_notification_schedule.sql` and revised in `drizzle/0007_notification_order.sql`,
+and scheduled with `pg_cron` to run every minute. It
 lives in SQL rather than here because it is one set-based statement and because Postgres can
 run it without this service being reachable or authenticated; `createNotificationSweeper` is a
 thin caller for triggering it from the application, not a second implementation.
@@ -92,6 +93,19 @@ they received, and their group `completed`. `fee` is the protocol paying itself,
 notification is back-filled for it — deliberately, because back-filling would make a
 notification a historical record rather than a message about something that just happened, and
 the activity feed already answers the historical question.
+
+**The order rows arrive in is carried by `created_at`,** which is why the insert sets it
+explicitly rather than letting it default. A sweep is one statement, and `now()` is
+transaction-start time, so every row in a sweep would otherwise share one timestamp — and the
+list query breaks a tie on `id`, which is a random UUID. For the ordinary case of a sweep
+catching up on a backlog, the order was a coin flip: a member could be shown round 2's payout
+above round 1's contribution. `derive_notifications` now carries each event's chain position
+(`ledger`, `tx_index`, `event_index` — the only total order decoded events have) through to the
+insert and offsets `created_at` by one microsecond per row in that order, continuing across
+batches within a call. The read model, its index and its paging are unchanged, and paging is by
+`limit`/`offset` rather than a timestamp cursor, so there is no precision to lose at the wire.
+The column still means "when this was derived", not "when this happened": a backlog swept in one
+pass carries the time of the sweep.
 
 ## Profile images, and who can touch them
 
