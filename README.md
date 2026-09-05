@@ -237,6 +237,25 @@ reads the contract.
   - `PROTOCOL_FEE_BPS` differing from the on-chain `50` bps.
   - `STELLAR_NETWORK=mainnet` without explicit `ALLOW_MAINNET=true`.
 
+## Dependencies
+
+CI runs `pnpm audit --audit-level high` before lint and test, so a known-vulnerable dependency
+fails the build in seconds rather than after a full run. **High and critical are the threshold**,
+not the default of low: the advisories this tree has carried were both in `esbuild`, reached
+only through build-time tooling (`drizzle-kit`, `tsup`) that is never shipped and never serves
+traffic. Those were fixed rather than tolerated — a lockfile override in `package.json` holds
+`esbuild` at a patched version — but the threshold stays where a real exploit path begins,
+because a gate that fails on unactionable findings is one people learn to re-run without
+reading.
+
+The gate can go red without anyone changing this repository, since the advisory database is
+amended continuously. That is intended: the next push is held until somebody looks.
+
+Reporting is only half a loop, so Dependabot raises the updating pull requests — patch and
+minor bumps grouped into one review, majors left to stand on their own. It does not cover the
+case of a dependency acquiring an advisory without a version change; that is what the audit
+step is for.
+
 ## Database security
 
 The database is a rebuildable index of chain activity, never the source of truth.

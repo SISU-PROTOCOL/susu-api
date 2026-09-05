@@ -1,0 +1,49 @@
+version: 2
+#
+# Automated dependency updates.
+#
+# WHY THIS EXISTS ALONGSIDE THE AUDIT GATE
+# The `Dependency audit` step in CI reports a known-vulnerable dependency and
+# stops the build. It does not fix one, and a red build is not a remedy — the
+# remedy is a pull request that moves the version. Dependabot raises those, which
+# is the half of the loop the gate cannot close. Neither is a substitute for the
+# other: this one is a proposal, and the gate is what makes ignoring it visible.
+#
+# WHY THE PULL REQUESTS ARE GROUPED
+# An ungrouped setup opens one pull request per dependency, and a week with eight
+# patch bumps is eight reviews — which is how a team learns to close them
+# unread. Grouping patch and minor updates into a single review makes the common
+# case one decision, and leaves the rare, consequential update standing on its
+# own.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # Patches and minor bumps arrive together. A patch is meant to be
+      # behaviour-preserving and a minor is meant to be additive, so these are
+      # reviewed as a batch.
+      routine:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    # A major bump is a breaking change by definition, so it gets its own pull
+    # request and its own reasoning rather than riding along in a batch.
+    ignore:
+      - dependency-name: '*'
+        update-types:
+          - version-update:semver-major
+
+  # Keeps the workflow actions themselves current. A pinned action going stale is
+  # a supply-chain risk in the same way a library is, and this is the job that
+  # would otherwise be nobody's.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
