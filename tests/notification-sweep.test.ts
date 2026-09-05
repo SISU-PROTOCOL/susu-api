@@ -360,6 +360,48 @@ describe('the notification sweep', () => {
     expect(rows.map((row) => row['round'])).toEqual([1, 2]);
   });
 
+  it('gives each row in a sweep a distinct timestamp, so order never falls to chance', async () => {
+    await link(USER_A, ALICE);
+    for (let index = 0; index < 5; index += 1) {
+      await event({
+        identity: `evt-tie-${index}`,
+        name: 'contribution',
+        ledger: 100 + index,
+        payload: { member: ALICE, round: index + 1, amount: '50000000' },
+      });
+    }
+
+    await createNotificationSweeper(test.db).sweep({ batchSize: 5, maxRounds: 1 });
+
+    // This is the bug that made the ordering test fail about half the time. One
+    // sweep is one statement, so `now()` — which is transaction-start time — gave
+    // every row the same `created_at`. The list query then broke the tie on `id`,
+    // and `id` is a random UUID: a coin flip, not an order. The timestamps must
+    // therefore be distinct, which is the property the fix is actually about,
+    // asserted directly rather than through its symptom.
+    //
+    // Counted in SQL rather than in JavaScript: the fix separates rows by a
+    // microsecond and `Date#getTime()` is milliseconds, so a comparison on this
+    // side of the wire would report five identical values whether or not the fix
+    // worked — a test that cannot fail.
+    const { rows } = await test.query(
+      `select count(*) as total, count(distinct created_at) as distinct_total
+       from public.notifications`,
+    );
+    // Coerced rather than compared as a string: PGlite hands `count(*)` back as a
+    // number, and Postgres over the wire as a string. The property under test is
+    // that the two counts are equal, not which driver said so.
+    expect(Number(rows[0]?.['total'])).toBe(5);
+    expect(Number(rows[0]?.['distinct_total'])).toBe(5);
+
+    // And ordered from the database's point of view, which is the only ordering
+    // the API's `limit`/`offset` paging can rely on.
+    const { rows: ordered } = await test.query(
+      `select data -> 'round' as round from public.notifications order by created_at`,
+    );
+    expect(ordered.map((row) => row['round'])).toEqual([1, 2, 3, 4, 5]);
+  });
+
   it('carries the group and transaction, so a message can be checked', async () => {
     await link(USER_A, ALICE);
     await link(USER_C, CAROL);
