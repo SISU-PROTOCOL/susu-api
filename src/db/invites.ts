@@ -21,6 +21,14 @@
  * The chain is still the authority on who may join and how large a group is.
  * This endpoint resolves a code and claims a use so that a limited invite is not
  * issued more times than it allows — nothing more.
+ *
+ * A USE IS NOT SPENT ON A JOIN THAT CANNOT HAPPEN
+ * A code can outlive the window it was made for: groups open, fill, and start,
+ * and a link shared before that keeps working afterwards. Redeeming such a code
+ * used to consume a use and then discover, from the client's first read of the
+ * group, that joining was never possible. `shouldClaim` lets the caller decline
+ * the claim in that case, so the invite is left intact. The code still resolves,
+ * because the client needs the group's address to explain what happened.
  */
 import { and, eq, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
@@ -47,8 +55,19 @@ export type RedeemOutcome =
    * `groupContractId` is returned because the code is what identifies the group:
    * an invite link carries a code and no address, so the caller learns which
    * contract to join from this.
+   *
+   * `claimed` is false in one case: the code resolved to a group that is already
+   * known not to be open, so there was nothing to spend a use on. The group is
+   * still reported, because the caller needs the address to say so — "this group
+   * has already started" is a better answer than "that code is no good", and it
+   * is only reachable if the code resolves.
    */
-  | { readonly outcome: 'redeemed'; readonly inviteId: string; readonly groupContractId: string }
+  | {
+      readonly outcome: 'redeemed';
+      readonly inviteId: string;
+      readonly groupContractId: string;
+      readonly claimed: boolean;
+    }
   /** No such code. */
   | { readonly outcome: 'not_found' }
   | { readonly outcome: 'revoked' }
@@ -70,8 +89,22 @@ export type InviteStore = {
    *
    * Idempotent per (invite, user): redeeming twice succeeds both times and
    * consumes one use.
+   *
+   * `shouldClaim` is asked once, before anything is written, whether this
+   * redemption should spend a use. It exists so that a code pointing at a group
+   * which can no longer be joined is still resolved — the caller needs the
+   * address — without consuming the invite. An answer of `false` is not a
+   * refusal: the group is reported as usual and nothing is recorded.
+   *
+   * It is deliberately a courtesy and not a control. The chain refuses the join
+   * on its own, and this answer can be stale by one indexer run, so it may only
+   * ever be used to decline to spend a use, never to grant a join.
    */
-  redeem(input: { code: string; userId: string }): Promise<RedeemOutcome>;
+  redeem(input: {
+    code: string;
+    userId: string;
+    shouldClaim?: (groupContractId: string) => Promise<boolean>;
+  }): Promise<RedeemOutcome>;
 };
 
 function toRecord(row: schema.InviteLink): InviteRecord {
@@ -105,7 +138,7 @@ export function createInviteStore(db: Database): InviteStore {
       return toRecord(row);
     },
 
-    async redeem({ code, userId }) {
+    async redeem({ code, userId, shouldClaim }) {
       return db.transaction(async (tx) => {
         // `for update` is the whole reason this is a transaction. Without it the
         // capacity check below is advisory: two concurrent joins would both read
@@ -142,7 +175,26 @@ export function createInviteStore(db: Database): InviteStore {
           .limit(1);
 
         if (existing !== undefined) {
-          return { outcome: 'redeemed', inviteId: invite.id, groupContractId } as const;
+          return {
+            outcome: 'redeemed',
+            inviteId: invite.id,
+            groupContractId,
+            claimed: true,
+          } as const;
+        }
+
+        // Asked before capacity and before anything is written, so a group that
+        // cannot be joined leaves the invite exactly as it was. Awaited inside the
+        // transaction because the answer is only needed here; it reads the read
+        // model rather than this transaction's tables, so it neither depends on
+        // nor extends the lock.
+        if (shouldClaim !== undefined && !(await shouldClaim(groupContractId))) {
+          return {
+            outcome: 'redeemed',
+            inviteId: invite.id,
+            groupContractId,
+            claimed: false,
+          } as const;
         }
 
         if (invite.maxUses !== null && invite.uses >= invite.maxUses) {
@@ -159,7 +211,12 @@ export function createInviteStore(db: Database): InviteStore {
           .set({ uses: sql`${inviteLinks.uses} + 1` })
           .where(eq(inviteLinks.id, invite.id));
 
-        return { outcome: 'redeemed', inviteId: invite.id, groupContractId } as const;
+        return {
+          outcome: 'redeemed',
+          inviteId: invite.id,
+          groupContractId,
+          claimed: true,
+        } as const;
       });
     },
   };

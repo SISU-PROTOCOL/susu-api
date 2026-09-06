@@ -211,6 +211,44 @@ describe('group existence', () => {
   });
 });
 
+describe('group status', () => {
+  it('is undefined when the index has not seen the group', async () => {
+    // Not the same as "not open". A group the indexer has not reached is the
+    // normal state for a group its creator has just made, and the caller has to
+    // be able to tell the two apart.
+    const { db } = stubDb([]);
+    expect(await createGroupReadModel(db).groupStatus(GROUP_CONTRACT_ID)).toBeUndefined();
+  });
+
+  it('reports the recorded status', async () => {
+    const { db } = stubDb([{ status: 'active' }]);
+    expect(await createGroupReadModel(db).groupStatus(GROUP_CONTRACT_ID)).toBe('active');
+  });
+
+  it('reads one column rather than assembling the whole group', async () => {
+    const { db, execute } = stubDb([{ status: 'open' }]);
+    await createGroupReadModel(db).groupStatus(GROUP_CONTRACT_ID);
+
+    // One statement, and it does not touch members or rounds. This runs while a
+    // visitor is waiting on a join, and `getGroup` would fetch all of it to
+    // answer the same question.
+    expect(execute).toHaveBeenCalledTimes(1);
+    const { sql } = renderedQuery(execute.mock.calls[0]?.[0]);
+    expect(sql).toContain('status');
+    expect(sql).not.toContain('group_members');
+  });
+
+  it('refuses a status it does not recognise, instead of calling it closed', async () => {
+    // A schema change has to be loud. Mapping an unknown value onto "not open"
+    // would quietly refuse every join in the system, and look like a bug in
+    // invites rather than a bug in the data.
+    const { db } = stubDb([{ status: 'halted' }]);
+    await expect(createGroupReadModel(db).groupStatus(GROUP_CONTRACT_ID)).rejects.toThrow(
+      /unrecognised value/,
+    );
+  });
+});
+
 describe('the member activity feed', () => {
   const WALLET = `G${'D'.repeat(55)}`;
 

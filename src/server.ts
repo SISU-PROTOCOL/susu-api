@@ -165,6 +165,15 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     return registrations.isRegistered(contractId);
   };
 
+  /**
+   * The group's status, or `undefined` when the index has not seen it.
+   *
+   * Deliberately not folded into `isKnownGroup`: "we know this group exists" and
+   * "we know what state it is in" are different answers, and a caller that needs
+   * the second must be able to tell it apart from not knowing at all.
+   */
+  const groupStatus = async (contractId: string) => groupReadModel.groupStatus(contractId);
+
   const requireAuth = createRequireAuth(verifyToken);
 
   await app.register(groupRoutes, {
@@ -179,6 +188,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     requireAuth,
     store: options.inviteStore ?? createInviteStore(getDb()),
     isKnownGroup,
+    groupStatus,
   });
 
   // Notifications are user-owned and injected as a model, like the account routes

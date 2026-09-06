@@ -140,6 +140,20 @@ export type GroupReadModel = {
   listGroups(query: ListGroupsQuery): Promise<PageResult<GroupSummary>>;
   getGroup(contractId: string): Promise<GroupDetail | undefined>;
   groupExists(contractId: string): Promise<boolean>;
+  /**
+   * The group's status as the index last recorded it, or `undefined` when the
+   * index has never seen the contract.
+   *
+   * Separate from `getGroup`, which answers the same question only after
+   * gathering every member and every round. The callers that need this are asking
+   * a single question with a single answer, and paying for the rest of the group
+   * to ask it would be wasteful on a path a visitor is waiting on.
+   *
+   * `undefined` means "not known", which is not the same as "not open". A group
+   * the indexer has not reached yet is exactly the case a creator hits, so the
+   * distinction has to survive all the way to the caller.
+   */
+  groupStatus(contractId: string): Promise<GroupStatus | undefined>;
   listContributions(contractId: string, page: Page): Promise<PageResult<ContributionRecord>>;
   listPayouts(contractId: string, page: Page): Promise<PageResult<PayoutRecord>>;
   listActivity(contractId: string, page: Page): Promise<PageResult<ActivityRecord>>;
@@ -426,6 +440,17 @@ export function createGroupReadModel(db: NodePgDatabase<typeof schema>): GroupRe
         select 1 as present from public.groups where contract_id = ${contractId}
       `);
       return rows.length > 0;
+    },
+
+    async groupStatus(contractId) {
+      const rows = await queryRows(sql`
+        select status from public.groups where contract_id = ${contractId}
+      `);
+      const row = (rows as { status: string }[])[0];
+      // Throws on a value it does not recognise, via `toGroupStatus`, rather than
+      // reporting "not open" for a schema change. A caller that cannot tell a
+      // broken status from a closed group would refuse joins for the wrong reason.
+      return row === undefined ? undefined : toGroupStatus(row.status);
     },
 
     async listContributions(contractId, page) {

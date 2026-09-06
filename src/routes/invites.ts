@@ -41,6 +41,7 @@ import { z } from 'zod';
 import { authenticatedUser } from '../auth/guard';
 import { generateInviteCode, isWellFormedInviteCode } from '../lib/invite-code';
 import type { InviteStore } from '../db/invites';
+import type { GroupStatus } from '../db/groups';
 import { invalidRequest } from './errors';
 
 /** A Soroban contract address. Matches the group routes' pattern. */
@@ -64,6 +65,16 @@ export type InviteRoutesOptions = {
    * therefore the index *or* an unexpired registration; see `db/registrations.ts`.
    */
   isKnownGroup: (contractId: string) => Promise<boolean>;
+  /**
+   * The group's status as the read model last saw it, or `undefined` when the
+   * index has not reached the contract yet.
+   *
+   * Used for one thing: declining to spend a use of a limited invite on a join
+   * the chain would refuse. The answer is advisory and may be stale by one
+   * indexer run, so it is only ever allowed to withhold a claim, never to
+   * promise that a join will succeed.
+   */
+  groupStatus: (contractId: string) => Promise<GroupStatus | undefined>;
   requireAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   /** Injectable so tests can assert the expiry rather than race a clock. */
   now?: () => Date;
@@ -112,7 +123,7 @@ export async function inviteRoutes(
   app: FastifyInstance,
   options: InviteRoutesOptions,
 ): Promise<void> {
-  const { store, isKnownGroup, requireAuth } = options;
+  const { store, isKnownGroup, groupStatus, requireAuth } = options;
   const now = options.now ?? (() => new Date());
 
   /**
@@ -138,7 +149,22 @@ export async function inviteRoutes(
     if (!isWellFormedInviteCode(code)) return inviteNotFound(reply);
 
     const user = authenticatedUser(request);
-    const result = await store.redeem({ code, userId: user.id });
+    const result = await store.redeem({
+      code,
+      userId: user.id,
+      // A code shared before the group started keeps working after it has, and
+      // the chain refuses a join unless the group is still open — so treating
+      // "the group has moved on" as a reason to spend a use bills the visitor for
+      // something that could never have worked.
+      //
+      // `undefined` means the index has not seen the group yet, which is the
+      // normal state for a creator's brand-new group, so it claims. Only a status
+      // that is positively known and not `open` withholds the claim.
+      shouldClaim: async (groupContractId) => {
+        const status = await groupStatus(groupContractId);
+        return status === undefined || status === 'open';
+      },
+    });
 
     switch (result.outcome) {
       case 'redeemed':

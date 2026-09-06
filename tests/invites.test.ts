@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { InviteStore, RedeemOutcome } from '../src/db/invites';
+import type { GroupStatus } from '../src/db/groups';
 import type { TokenVerifier } from '../src/auth/verify';
 import { configureTestEnv, GROUP_CONTRACT_ID, OTHER_CONTRACT_ID } from './support/fixtures';
 
@@ -44,15 +45,27 @@ function fakeStore(): FakeStore {
   } as unknown as FakeStore;
 }
 
-type Harness = { app: FastifyInstance; store: FakeStore; groupExists: ReturnType<typeof vi.fn> };
+type Harness = {
+  app: FastifyInstance;
+  store: FakeStore;
+  groupExists: ReturnType<typeof vi.fn>;
+  groupStatus: ReturnType<typeof vi.fn>;
+};
 
 async function harness(
-  options: { store?: FakeStore; known?: boolean; registered?: boolean } = {},
+  options: {
+    store?: FakeStore;
+    known?: boolean;
+    registered?: boolean;
+    /** What the read model says the group's status is, or `undefined` for "not seen yet". */
+    status?: GroupStatus;
+  } = {},
 ): Promise<Harness> {
   const { buildServer } = await import('../src/server');
 
   const store = options.store ?? fakeStore();
   const groupExists = vi.fn(async () => options.known ?? true);
+  const groupStatus = vi.fn(async () => options.status);
   // The index trailing the chain is the case this covers: `known` is the index's
   // answer, `registered` the creator's unexpired registration.
   const isRegistered = vi.fn(async () => options.registered ?? false);
@@ -65,6 +78,7 @@ async function harness(
     registrations: { register: vi.fn(), isRegistered } as never,
     readModel: {
       groupExists,
+      groupStatus,
       listGroups: vi.fn(),
       getGroup: vi.fn(),
       listContributions: vi.fn(),
@@ -74,7 +88,7 @@ async function harness(
   });
   built.push(app);
 
-  return { app, store, groupExists };
+  return { app, store, groupExists, groupStatus };
 }
 
 describe('POST /api/v1/groups/:contractId/invites', () => {
@@ -303,7 +317,13 @@ describe('POST /api/v1/invites/redeem', () => {
     // The user is the token's, never the body's. The store is not told which
     // group: the code names it, which is what lets an invite link work without
     // carrying an address.
-    expect(store.redeem).toHaveBeenCalledWith({ code: CODE, userId: USER_ID });
+    // The store is also asked whether this redemption should spend a use. The
+    // answer is exercised in its own block below; here only the call shape matters.
+    expect(store.redeem).toHaveBeenCalledWith({
+      code: CODE,
+      userId: USER_ID,
+      shouldClaim: expect.any(Function),
+    });
   });
 
   it('needs no group address, because the code identifies the group', async () => {
@@ -492,7 +512,13 @@ describe('POST /api/v1/groups/:contractId/join', () => {
       groupContractId: GROUP_CONTRACT_ID,
       inviteId: 'invite-id',
     });
-    expect(store.redeem).toHaveBeenCalledWith({ code: CODE, userId: USER_ID });
+    // The store is also asked whether this redemption should spend a use. The
+    // answer is exercised in its own block below; here only the call shape matters.
+    expect(store.redeem).toHaveBeenCalledWith({
+      code: CODE,
+      userId: USER_ID,
+      shouldClaim: expect.any(Function),
+    });
   });
 
   it('reports a code for a different group as absent', async () => {
@@ -563,5 +589,71 @@ describe('POST /api/v1/groups/:contractId/join', () => {
 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({ error: 'invite_exhausted' });
+  });
+});
+
+/**
+ * Whether redeeming spends a use of the invite.
+ *
+ * A code can outlive the window it was made for: the group fills up, somebody
+ * calls `start`, and the link keeps circulating. The chain refuses a join unless
+ * the group is still `open`, so spending a use on that code bills the visitor for
+ * something that could never have worked.
+ *
+ * What is tested here is only the decision the route hands the store. That the
+ * decision is honoured - nothing written, no use spent - is a property of the
+ * store, and is checked against a real Postgres in `invite-store.test.ts`.
+ */
+describe('whether a redemption should claim a use', () => {
+  /** The `shouldClaim` the route passed to the store on its first redemption. */
+  function claimCheck(store: FakeStore): (groupContractId: string) => Promise<boolean> {
+    const [argument] = store.redeem.mock.calls[0] as [
+      { shouldClaim: (groupContractId: string) => Promise<boolean> },
+    ];
+    return argument.shouldClaim;
+  }
+
+  /** Redeems once against a read model that reports `status`, and returns the check. */
+  async function checkAgainst(status: GroupStatus | undefined): Promise<{
+    shouldClaim: (groupContractId: string) => Promise<boolean>;
+    groupStatus: ReturnType<typeof vi.fn>;
+  }> {
+    const { app, store, groupStatus } = await harness({ status });
+
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/invites/redeem',
+      headers: AUTH,
+      payload: { code: CODE },
+    });
+
+    return { shouldClaim: claimCheck(store), groupStatus };
+  }
+
+  it('claims while the group is still open', async () => {
+    const { shouldClaim } = await checkAgainst('open');
+    expect(await shouldClaim(GROUP_CONTRACT_ID)).toBe(true);
+  });
+
+  it('claims when the index has not seen the group yet', async () => {
+    // The creator's own case, and the one that would break inviting if this were
+    // wrong: a group is registered the moment it is created, and the indexer
+    // trails by up to a run. "Not known" must not read as "not open".
+    const { shouldClaim, groupStatus } = await checkAgainst(undefined);
+
+    expect(await shouldClaim(GROUP_CONTRACT_ID)).toBe(true);
+    // Asked about the group, not left to guess: the answer depends on which group
+    // the code resolves to, which only the store knows.
+    expect(groupStatus).toHaveBeenCalledWith(GROUP_CONTRACT_ID);
+  });
+
+  it('withholds the claim once the group has started', async () => {
+    const { shouldClaim } = await checkAgainst('active');
+    expect(await shouldClaim(GROUP_CONTRACT_ID)).toBe(false);
+  });
+
+  it('withholds the claim once every round has paid out', async () => {
+    const { shouldClaim } = await checkAgainst('completed');
+    expect(await shouldClaim(GROUP_CONTRACT_ID)).toBe(false);
   });
 });
