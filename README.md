@@ -74,6 +74,11 @@ lives in SQL rather than here because it is one set-based statement and because 
 run it without this service being reachable or authenticated; `createNotificationSweeper` is a
 thin caller for triggering it from the application, not a second implementation.
 
+The API does **not** start that caller on boot, and that is deliberate: the schedule belongs to
+`pg_cron`, so derivation continues when this service is down, and a second trigger inside the
+service would only add a way for the two to disagree about when the work happened. The sweeper is
+for running it by hand while investigating, and for deployments with no `pg_cron`.
+
 The chain has never heard of a user — it knows wallet addresses — so turning events into
 messages needs `wallet_links`. That is why the indexer does not do it: it writes the faithful
 record, and this is a separate step over the same source. **Notifications are therefore never

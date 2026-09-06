@@ -1,4 +1,4 @@
-import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -133,10 +133,12 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   // the signing secret and the message shape; the store owns the two facts the
   // database enforces — that a nonce is spent once, and that an address belongs
   // to one account.
+  const walletLinkStore = options.walletLinkStore ?? createWalletLinkStore(getDb());
+
   await app.register(walletRoutes, {
     prefix: '/api/v1',
     requireAuth: createRequireAuth(verifyToken),
-    store: options.walletLinkStore ?? createWalletLinkStore(getDb()),
+    store: walletLinkStore,
     nonces:
       options.nonceIssuer ??
       createNonceIssuer({
@@ -208,7 +210,6 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   app.setNotFoundHandler(async (_request, reply) => {
     await reply.code(404).send({ error: 'not_found' });
   });
-
   app.setErrorHandler(async (error: FastifyError, request, reply) => {
     request.log.error({ err: error }, 'request failed');
 
@@ -219,5 +220,57 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
     });
   });
 
+  // Started only when the store was not injected, which is the same condition as
+  // "this is the real service": a test that supplies a store does not want a
+  // background timer, and one that does not will not live long enough to see
+  // this fire.
+  if (options.walletLinkStore === undefined) {
+    startNonceReaping(walletLinkStore, app.log);
+  }
+
   return app;
+}
+
+/** How often spent nonces are cleared. Well inside the five-minute nonce lifetime. */
+const REAP_INTERVAL_MS = 15 * 60 * 1000;
+
+/**
+ * Clears spent nonces whose expiry has passed, on a timer.
+ *
+ * A nonce row is deliberately kept past its expiry rather than deleted on the way
+ * out, so that a replayed nonce is refused as a replay rather than as an unknown
+ * token. That means something has to remove them, and nothing did: the store's
+ * `reap` was written, tested and never called, so `wallet_link_nonces` grew by a
+ * row for every abandoned link attempt with no bound on it.
+ *
+ * This runs in the process rather than as a database schedule because it is
+ * housekeeping, not a pipeline: it is allowed to wait for this service to be
+ * running, and an instance that restarts simply reaps sooner. Two instances
+ * reaping at once is harmless — the loser deletes nothing.
+ *
+ * A failure is logged and retried on the next tick. An untidy table is not a
+ * reason to take the service down.
+ */
+export function startNonceReaping(
+  store: Pick<WalletLinkStore, 'reap'>,
+  log: Pick<FastifyBaseLogger, 'info' | 'warn'>,
+  intervalMs: number = REAP_INTERVAL_MS,
+): ReturnType<typeof setInterval> {
+  const timer = setInterval(() => {
+    store
+      .reap(new Date())
+      .then((count) => {
+        if (count > 0) {
+          log.info({ event: 'nonce_reap', count }, 'cleared expired wallet-link nonces');
+        }
+      })
+      .catch((error: unknown) => {
+        log.warn({ event: 'nonce_reap_failed', err: error }, 'could not clear expired nonces');
+      });
+  }, intervalMs);
+
+  // Housekeeping must never be the reason the process stays alive.
+  timer.unref();
+
+  return timer;
 }
