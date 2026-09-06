@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { configureTestEnv } from './support/fixtures';
 
@@ -92,5 +92,88 @@ describe('response headers', () => {
     const response = await app.inject({ method: 'GET', url: '/health' });
     expect(response.headers['x-content-type-options']).toBe('nosniff');
     expect(response.headers['x-frame-options']).toBeDefined();
+  });
+});
+
+describe('expired wallet-link nonces', () => {
+  /**
+   * A nonce row is kept past its expiry on purpose, so a replay is refused as a
+   * replay rather than as an unknown token. That means something has to remove
+   * them, and for a while nothing did — `reap` was written, tested, and never
+   * called, so the table grew by a row per abandoned link attempt with no bound.
+   */
+  it('are cleared on a timer', async () => {
+    const { startNonceReaping } = await import('../src/server');
+
+    vi.useFakeTimers();
+    try {
+      const reap = vi.fn(async () => 3);
+      const log = { info: vi.fn(), warn: vi.fn() };
+
+      const timer = startNonceReaping({ reap }, log as never, 1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(reap).toHaveBeenCalledTimes(1);
+      expect(reap).toHaveBeenCalledWith(expect.any(Date));
+
+      // Something was cleared, so it is worth a line in the log.
+      expect(log.info).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'nonce_reap', count: 3 }),
+        expect.any(String),
+      );
+
+      clearInterval(timer);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('survive a failing reap, which is logged rather than fatal', async () => {
+    const { startNonceReaping } = await import('../src/server');
+
+    vi.useFakeTimers();
+    try {
+      const reap = vi.fn(async () => {
+        throw new Error('database is unreachable');
+      });
+      const log = { info: vi.fn(), warn: vi.fn() };
+
+      const timer = startNonceReaping({ reap }, log as never, 1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'nonce_reap_failed' }),
+        expect.any(String),
+      );
+
+      // An untidy table is not a reason to take the service down, so the next
+      // tick tries again.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(reap).toHaveBeenCalledTimes(2);
+
+      clearInterval(timer);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('says nothing when there was nothing to clear', async () => {
+    const { startNonceReaping } = await import('../src/server');
+
+    vi.useFakeTimers();
+    try {
+      const reap = vi.fn(async () => 0);
+      const log = { info: vi.fn(), warn: vi.fn() };
+
+      const timer = startNonceReaping({ reap }, log as never, 1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(reap).toHaveBeenCalledTimes(1);
+      expect(log.info).not.toHaveBeenCalled();
+
+      clearInterval(timer);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

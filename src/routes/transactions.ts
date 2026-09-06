@@ -14,6 +14,7 @@
  * and a fee; the wallet signs; the client submits.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { authenticatedUser } from '../auth/guard';
 import {
@@ -64,6 +65,35 @@ const prepareBody = z.object({
   transactionXdr: z.string().min(1).max(MAX_ENVELOPE_LENGTH, 'envelope is too large'),
 });
 
+/**
+ * A budget for `/prepare` of the caller's own, rather than a share of everyone's.
+ *
+ * This is the one route that spends the service's RPC quota, so the global
+ * limiter is the wrong shape for it: that limiter is a single budget of 100 a
+ * minute shared by every route and every caller, which means one caller
+ * exhausting it refuses everyone else while a determined one is barely slowed —
+ * acquiring a second session is cheaper than acquiring a second minute.
+ *
+ * Keyed by the session, because a session is the thing a caller has to acquire
+ * and rotate. The token is hashed before it becomes a key so the limiter's store
+ * does not accumulate credentials, and it is used only as a key — the raw value
+ * still goes to the verifier and nowhere else.
+ */
+const PREPARE_RATE_LIMIT = {
+  max: 20,
+  timeWindow: '1 minute',
+  keyGenerator: (request: FastifyRequest): string => {
+    const header = request.headers.authorization;
+    if (typeof header === 'string' && header.startsWith('Bearer ')) {
+      const digest = createHash('sha256').update(header.slice('Bearer '.length)).digest('hex');
+      return `session:${digest.slice(0, 32)}`;
+    }
+    // Unreachable while the route requires authentication, and kept so that the
+    // limiter still has a key if the guard is ever moved or made optional.
+    return `ip:${request.ip}`;
+  },
+} as const;
+
 export async function transactionRoutes(
   app: FastifyInstance,
   options: TransactionRoutesOptions,
@@ -111,32 +141,40 @@ export async function transactionRoutes(
    * envelope against the current ledger, and a resource footprint is not a fact
    * that survives being cached.
    */
-  app.post('/transactions/prepare', { preHandler: requireAuth }, async (request, reply) => {
-    const parsed = prepareBody.safeParse(request.body);
-    if (!parsed.success) return invalidRequest(reply, parsed.error);
+  app.post(
+    '/transactions/prepare',
+    {
+      preHandler: requireAuth,
+      // Replaces the global budget for this route rather than adding to it.
+      config: { rateLimit: PREPARE_RATE_LIMIT },
+    },
+    async (request, reply) => {
+      const parsed = prepareBody.safeParse(request.body);
+      if (!parsed.success) return invalidRequest(reply, parsed.error);
 
-    // Called for its side effect of refusing an unauthenticated request before any
-    // RPC work happens. Nothing else about the caller is needed: the envelope's
-    // source is the account that will sign, and it is not this service's job to
-    // decide whether that account may make the call — the contract does that.
-    authenticatedUser(request);
+      // Called for its side effect of refusing an unauthenticated request before any
+      // RPC work happens. Nothing else about the caller is needed: the envelope's
+      // source is the account that will sign, and it is not this service's job to
+      // decide whether that account may make the call — the contract does that.
+      authenticatedUser(request);
 
-    const outcome: PrepareOutcome = await prepareInvocation({
-      envelopeXdr: parsed.data.transactionXdr,
-      networkPassphrase,
-      simulate,
-      isAllowedContract,
-    });
+      const outcome: PrepareOutcome = await prepareInvocation({
+        envelopeXdr: parsed.data.transactionXdr,
+        networkPassphrase,
+        simulate,
+        isAllowedContract,
+      });
 
-    reply.header('cache-control', 'no-store');
+      reply.header('cache-control', 'no-store');
 
-    if (outcome.status === 'invalid') {
-      // A refusal here is about the envelope, not about the protocol, so the
-      // reason is safe to name: it tells a client which of its own mistakes to fix
-      // without revealing anything about this service's state.
-      return reply.code(400).send({ error: outcome.reason });
-    }
+      if (outcome.status === 'invalid') {
+        // A refusal here is about the envelope, not about the protocol, so the
+        // reason is safe to name: it tells a client which of its own mistakes to fix
+        // without revealing anything about this service's state.
+        return reply.code(400).send({ error: outcome.reason });
+      }
 
-    return reply.send({ data: outcome });
-  });
+      return reply.send({ data: outcome });
+    },
+  );
 }

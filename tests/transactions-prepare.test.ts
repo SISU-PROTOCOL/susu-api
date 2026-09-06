@@ -178,6 +178,33 @@ describe('POST /api/v1/transactions/prepare', () => {
     expect(prepared.operations).toHaveLength(1);
   });
 
+  it('gives each caller their own simulation budget', async () => {
+    // `prepare` spends this service's RPC quota, so it carries a budget of its
+    // own rather than a share of the global one: a single budget of 100 a minute
+    // means one caller exhausting it refuses everybody else, while a caller with
+    // a second session is not slowed at all.
+    const { app, simulate } = await harness({ knownGroup: GROUP });
+
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < 21; attempt += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/transactions/prepare',
+        headers: AUTH,
+        payload: { transactionXdr: envelopeXdr(GROUP, 'contribute') },
+      });
+      statuses.push(response.statusCode);
+    }
+
+    expect(statuses.slice(0, 20).every((status) => status === 200)).toBe(true);
+    expect(statuses[20]).toBe(429);
+
+    // The refusal is about the caller's budget, not about the envelope: the
+    // calls that were allowed all reached the simulator, and the one that was
+    // refused did not.
+    expect(simulate).toHaveBeenCalledTimes(20);
+  });
+
   it('never stores a prepared envelope', async () => {
     const { app } = await harness({ knownGroup: GROUP });
 
