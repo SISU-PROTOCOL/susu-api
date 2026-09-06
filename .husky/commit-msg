@@ -1,0 +1,23 @@
+# Strips the "Co-authored-by: Cursor" trailer that this development environment
+# injects into commit messages.
+#
+# This logic used to live in `.git/hooks/commit-msg`. Installing husky points
+# `core.hooksPath` at `.husky/_`, which silently stopped that file from running:
+# the trailer would have started appearing in history with nothing to indicate
+# why. It lives here now because this is where git looks, and it is committed
+# because a hook that only exists in one clone's `.git` is a hook the next clone
+# does not have.
+#
+# $1 is the path to the message file git has already written and will use as-is
+# once this hook exits, so rewriting it here means the trailer never reaches the
+# commit object — whichever code path produced the message.
+#
+# Only that one trailer is removed. Co-authored-by: dependabot and every other
+# trailer are left untouched.
+
+msg_file="$1"
+
+perl -0777 -i -pe '
+  s/^Co-authored-by: Cursor <cursoragent\@cursor\.com>\r?\n//mg;
+  s/\n+\z/\n/;
+' "$msg_file"

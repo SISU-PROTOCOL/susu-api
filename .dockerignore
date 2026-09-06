@@ -1,0 +1,35 @@
+# The build context is sent to the daemon before the build starts, so everything
+# excluded here is both a smaller upload and a smaller surface for an accidental
+# `COPY .`.
+
+# Configuration. `.env` holds real credentials on this machine; the image reads
+# its configuration from the environment instead, so this is excluded first among
+# equals. The example file has no values to leak.
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output are produced inside the image. A local
+# `node_modules` or `dist` would be platform-specific and would shadow what the
+# build stage just compiled.
+node_modules
+dist
+*.tsbuildinfo
+
+# Test output, not test sources: `tests/` is copied into the build stage because
+# `tsc --noEmit` typechecks it.
+coverage
+
+# Version control and CI metadata are not build inputs, and `.git` alone is
+# usually the largest thing in a context.
+.git
+.gitignore
+.github
+
+# Local tooling and editor cruft.
+.husky
+.vscode
+.idea
+.DS_Store
+*.log
+pnpm-debug.log*

@@ -1,0 +1,8 @@
+# Lint and format the files in this commit, and only those files.
+#
+# `lint-staged` hands the staged paths to eslint and prettier, so a commit is
+# never blocked by a problem that is not part of it and a fix it makes lands in
+# the commit rather than in the working tree. A repo-wide run here would rewrite
+# everyone's in-progress files on every commit, which is why this hook is scoped
+# this way rather than calling `pnpm lint` and `pnpm format`.
+pnpm exec lint-staged
