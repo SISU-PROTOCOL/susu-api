@@ -58,6 +58,7 @@ Two things stand between this and mainnet. Neither of them is code:
 - [This service is not a custodian](#this-service-is-not-a-custodian)
 - [Stack](#stack)
 - [Endpoints](#endpoints)
+- [When redeeming an invite does not spend a use](#when-redeeming-an-invite-does-not-spend-a-use)
 - [Why `GET /api/v1/me/activity` exists next to the per-group activity list](#why-get-apiv1meactivity-exists-next-to-the-per-group-activity-list)
 - [Notifications, and who derives them](#notifications-and-who-derives-them)
 - [Profile images, and who can touch them](#profile-images-and-who-can-touch-them)
@@ -117,6 +118,26 @@ The account surface is `GET`, `PATCH` and `DELETE /api/v1/me`; wallet linking is
 (codes are opaque, so the client learns the group from the response) or
 `POST /api/v1/groups/:contractId/join` when the client already knows it; notifications are
 `GET /api/v1/notifications` and `POST /api/v1/notifications/:id/read`.
+
+## When redeeming an invite does not spend a use
+
+A code outlives the window it was made for. A group opens, fills up, and someone calls
+`start`; the link keeps circulating. The chain refuses a join unless the group is still
+`open`, so redeeming such a code used to consume a use and only then let the client discover,
+on its first read of the group, that joining had never been possible.
+
+Now it resolves without consuming: the response still names the group — the client needs the
+address to explain *why*, and "this group has already started" is a better answer than "that
+code is no good" — and nothing is written. No use, and no redemption row that would make the
+visitor look like an existing member.
+
+Two properties keep this safe. The answer comes from the read model and can be stale by one
+indexer run, so it is only ever allowed to **withhold** a claim and never to grant a join; the
+chain decides that. And an unknown group is treated as claimable, not as closed: a group whose
+creator has just registered it and whose indexer run has not happened yet is exactly the case
+this must not break. Idempotence also outranks it — a member who already redeemed is reported
+as such without asking, because their use was spent legitimately and the invite is still
+theirs.
 
 ## Why `GET /api/v1/me/activity` exists next to the per-group activity list
 
