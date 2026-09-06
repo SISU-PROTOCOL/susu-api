@@ -1,0 +1,152 @@
+# Render Blueprint for susu-api.
+#
+# Point Render at this repository and it reads this file: the service, its
+# runtime, its health check and the shape of its configuration all come from
+# here, so a fresh deploy is one connection rather than a form filled in by hand
+# and remembered slightly differently the second time.
+#
+# The values that are *not* here are the ones that matter most. Every secret is
+# `sync: false`, which makes Render prompt for it during creation and keep it out
+# of git — a blueprint is a committed file, and a committed credential is a
+# leaked credential.
+#
+# See docs/DEPLOY_RENDER.md for the walkthrough, including the two settings that
+# will stop the service from booting if they are wrong.
+
+services:
+  - type: web
+    name: susu-api
+    runtime: docker
+
+    # The Dockerfile is at the repo root and is deliberately the deployment
+    # mechanism rather than the Node runtime. It pins Node 22 to match
+    # `engines.node`, installs from the lockfile with `--frozen-lockfile`, keeps
+    # devDependencies out of the runtime image, and runs as an unprivileged user.
+    # None of that has to be re-stated as build and start commands here, and none
+    # of it can drift out of step with what CI builds.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    plan: free
+    branch: main
+    autoDeploy: true
+
+    # Render's regions are oregon, ohio, virginia, frankfurt, singapore. This is
+    # chosen for proximity to the Supabase project, not to the browser: every
+    # request this service serves fans out into database queries, so the
+    # app-to-database hop is paid far more often than the browser-to-app one. If
+    # the Supabase project is not in EU West, move this to match it.
+    region: frankfurt
+
+    # `src/routes/health.ts` is deliberately I/O-free, so a failure here means
+    # the process is gone or wedged rather than that a dependency is slow. That
+    # is the question a health check should be asking, and it is why this path is
+    # safe to poll.
+    healthCheckPath: /health
+
+    envVars:
+      # ---------------------------------------------------------------------
+      # Runtime. Not secret, and fixed by the deployment rather than by choice.
+      # ---------------------------------------------------------------------
+
+      # The Fastify logger switches to JSON, and stack traces stop being sent to
+      # clients, when this is `production`. `src/lib/env.ts` also treats it as a
+      # required value, so there is no default that would quietly do the wrong
+      # thing.
+      - key: NODE_ENV
+        value: 'production'
+
+      # Render forwards inbound requests to this port on 0.0.0.0, and 10000 is
+      # its documented default for web services. It is stated explicitly because
+      # `src/lib/env.ts` would otherwise fall back to 3000, which Render does not
+      # route to — a mismatch that presents as a deploy that builds fine and then
+      # never answers.
+      - key: PORT
+        value: '10000'
+
+      - key: HOST
+        value: '0.0.0.0'
+
+      # ---------------------------------------------------------------------
+      # Stellar. Public values; the network is Testnet, deliberately.
+      # ---------------------------------------------------------------------
+
+      - key: STELLAR_NETWORK
+        value: 'testnet'
+      - key: STELLAR_RPC_URL
+        value: 'https://soroban-testnet.stellar.org'
+      - key: STELLAR_NETWORK_PASSPHRASE
+        value: 'Test SDF Network ; September 2015'
+
+      # A financial invariant, not a preference. The API refuses to start unless
+      # this matches the deployed contracts, so a typo here is a boot failure
+      # rather than a silently different fee.
+      - key: PROTOCOL_FEE_BPS
+        value: '50'
+
+      # The safety switch that keeps Mainnet writes impossible. It stays `false`;
+      # turning it on is a decision that requires the Mainnet readiness gate to
+      # have been passed first, not an environment variable to flip on a hosting
+      # dashboard.
+      - key: ALLOW_MAINNET
+        value: 'false'
+
+      # ---------------------------------------------------------------------
+      # Secrets. Render prompts for each of these once, during creation.
+      # ---------------------------------------------------------------------
+
+      # The Supabase *pooler* connection string, not `db.<ref>.supabase.co`:
+      # the direct host publishes only an IPv6 address and Render's egress is
+      # IPv4.
+      - key: DATABASE_URL
+        sync: false
+
+      # Supabase publishes its CA under Project Settings -> Database -> SSL
+      # configuration. Copy it from the dashboard, never from the connection
+      # itself.
+      #
+      # This is effectively required. `src/db/ssl.ts` refuses to start against a
+      # remote database it cannot authenticate, because an encrypted-but-
+      # unverified connection behaves identically to a verified one and the
+      # difference would never be noticed. The alternative is the next variable,
+      # which accepts that gap on purpose.
+      - key: DATABASE_SSL_CA
+        sync: false
+
+      # Set to `'true'` only to skip the above, accepting a machine-in-the-middle
+      # risk on the database connection. The name is an acknowledgement, not a
+      # feature.
+      - key: DATABASE_SSL_ALLOW_UNVERIFIED
+        sync: false
+
+      - key: SUPABASE_URL
+        sync: false
+
+      # Bypasses Row Level Security. Server-only: it must never reach the browser
+      # and is never logged. `susu-web` uses the anon key, which is a different
+      # value.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      - key: FACTORY_CONTRACT_ID
+        sync: false
+      - key: USDC_CONTRACT_ID
+        sync: false
+      - key: TREASURY_ADDRESS
+        sync: false
+
+      # The web client's origin, comma-separated if there is more than one, e.g.
+      # `https://susu-web.onrender.com`. Include the scheme and no trailing slash.
+      #
+      # An empty allowlist means no cross-origin access at all, so a browser will
+      # refuse to call this service until it is set — and the failure appears in
+      # the browser's console, not in this service's logs.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+      # Signs the wallet-link nonces. Generate rather than choose: Render's
+      # `generateValue` produces a random base64 256-bit value, comfortably past
+      # the 32-character minimum `src/lib/env.ts` enforces. Rotating it
+      # invalidates outstanding nonces, which is the intended effect.
+      - key: WALLET_NONCE_SECRET
+        generateValue: true

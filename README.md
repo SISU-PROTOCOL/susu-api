@@ -74,6 +74,7 @@ Two gates stand between this and Mainnet. The machinery for both is written; nei
 - [Development](#development)
 - [Checks](#checks)
 - [Configuration](#configuration)
+- [Deployment](#deployment)
 - [Contributing](#contributing)
 - [Security](#security)
 - [License](#license)
@@ -455,6 +456,15 @@ pnpm db:security-test   # requires DATABASE_URL and psql
 
 All configuration is **server-only**. Never add a value from `.env` to any `VITE_`-prefixed
 variable — those are bundled into the browser.
+
+## Deployment
+
+[`docs/DEPLOY_RENDER.md`](docs/DEPLOY_RENDER.md) is a walkthrough for hosting this service on
+Render: the Supabase SSL configuration it refuses to start without, the port a hosting dashboard will
+not guess for you, and why this service has to be deployed before `susu-web` rather than after it.
+
+The blueprint is [`render.yaml`](render.yaml), which supplies everything that is not a secret and
+prompts once for everything that is.
 
 ## Contributing
 
