@@ -1,13 +1,77 @@
 # Susu Protocol — API
 
 [![CI](https://github.com/susu-labs/susu-api/actions/workflows/ci.yml/badge.svg)](https://github.com/susu-labs/susu-api/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Status: Testnet beta](https://img.shields.io/badge/status-testnet%20beta-orange.svg)](#project-status)
+[![Audit: not yet reviewed](https://img.shields.io/badge/audit-not%20yet%20reviewed-critical.svg)](#security)
 
 Backend API for **Susu Protocol** — a non-custodial rotating savings protocol on Stellar.
 
-> **Status: Phase 6 — group read model.** Health endpoints, configuration validation,
-> the read-only group API over the indexer's chain-derived tables, accounts, wallet
-> linking, invites, notifications, transaction receipts and transaction preparation are
-> in place. Nothing here is audited.
+It serves the read model over the indexer's chain-derived tables, and owns accounts, sessions,
+wallet linking, invites, notifications, avatar metadata, and transaction preparation. It is an
+**application layer only**: it holds no key, signs nothing, and can be deleted without affecting a
+single balance.
+
+> **This code is unaudited and not mainnet-ready.** It runs against Stellar Testnet. Read
+> [Project status](#project-status) before you read anything else.
+
+---
+
+## The system
+
+Susu is four repositories. This one serves the read model and the application layer.
+
+| Repository | Responsibility | Runs on |
+| --- | --- | --- |
+| [`susu-contracts`](https://github.com/susu-labs/susu-contracts) | Soroban contracts. The financial authority. | **Testnet** |
+| [`susu-indexer`](https://github.com/susu-labs/susu-indexer) | Reads chain events, records them in Postgres on a schedule. | **Testnet** (Supabase Cron) |
+| **`susu-api`** *(you are here)* | Read model, accounts, invites, notifications, transaction preparation. | Local |
+| [`susu-web`](https://github.com/susu-labs/susu-web) | The client. | Local |
+
+If database state ever conflicts with Stellar/Soroban state, **the chain wins** and this service is
+wrong.
+
+## Project status
+
+**Testnet beta. Not audited. Not mainnet-ready.**
+
+All twelve planned build phases are implemented, and every endpoint below is covered by tests. The
+chain-derived read surface, accounts and sessions, wallet linking, invites, notifications,
+avatars, and transaction preparation are all in place.
+
+This service is **not hosted anywhere** — there is no deployment configuration in this repository,
+and it is run locally against the hosted Testnet database. Hosting it is a deployment decision that
+has not been made, and it is not on the critical path: the contracts and the indexer are the parts
+that must be live, and the client talks to the chain directly for anything that matters.
+
+Two things stand between this and mainnet. Neither of them is code:
+
+| Gate | State |
+| --- | --- |
+| **Independent security review** | **Not commissioned.** See [`susu-contracts/docs/AUDIT_SCOPE.md`](https://github.com/susu-labs/susu-contracts/blob/main/docs/AUDIT_SCOPE.md). |
+| **Mainnet readiness** | **Implemented, and currently `NO-GO` — by design.** See [`susu-contracts/docs/MAINNET_READINESS.md`](https://github.com/susu-labs/susu-contracts/blob/main/docs/MAINNET_READINESS.md). |
+
+## Contents
+
+- [This service is not a custodian](#this-service-is-not-a-custodian)
+- [Stack](#stack)
+- [Endpoints](#endpoints)
+- [Why `GET /api/v1/me/activity` exists next to the per-group activity list](#why-get-apiv1meactivity-exists-next-to-the-per-group-activity-list)
+- [Notifications, and who derives them](#notifications-and-who-derives-them)
+- [Profile images, and who can touch them](#profile-images-and-who-can-touch-them)
+- [Why `POST /api/v1/transactions/prepare` exists and cannot move money](#why-post-apiv1transactionsprepare-exists-and-cannot-move-money)
+- [Why `POST /api/v1/groups` exists and does not create a group](#why-post-apiv1groups-exists-and-does-not-create-a-group)
+- [The read model](#the-read-model)
+- [Security controls](#security-controls)
+- [Dependencies](#dependencies)
+- [Database security](#database-security)
+- [Connecting to a hosted database](#connecting-to-a-hosted-database)
+- [Development](#development)
+- [Checks](#checks)
+- [Configuration](#configuration)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
 
 ## This service is not a custodian
 
@@ -26,7 +90,7 @@ Node.js · TypeScript · Fastify · Zod · Drizzle ORM · PostgreSQL (Supabase) 
 ## Endpoints
 
 | Method | Path | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/health` | Liveness. Does no I/O. |
 | `GET` | `/ready` | Readiness, including a database probe. |
 | `GET` | `/api/v1/groups` | List groups. Filters: `status`, `creator`, `member`. |
@@ -182,6 +246,10 @@ as a failed action.
 Fee sponsorship is still **not** implemented, and is a product decision rather than an
 implementation detail: it would put a spending key in this service.
 
+The per-session rate limit on this route is deliberately separate from the global one: it is the
+only endpoint that spends this service's RPC budget on a caller's behalf, so it carries its own
+budget keyed by session rather than sharing a limit with cheap reads.
+
 ## Why `POST /api/v1/groups` exists and does not create a group
 
 A group's address is the hash of its own deployment, so the only way to learn that a
@@ -290,7 +358,7 @@ the connection string.
 
 Supabase serves its pooler from a **private certificate authority**, not a public one:
 
-```
+```text
 CN=*.pooler.supabase.com
 CN=Supabase Intermediate 2021 CA
 CN=Supabase Root 2021 CA        <- self-signed
@@ -362,6 +430,13 @@ pnpm db:security-test   # requires DATABASE_URL and psql
 
 All configuration is **server-only**. Never add a value from `.env` to any `VITE_`-prefixed
 variable — those are bundled into the browser.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and the [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+
+Changes to financial semantics, authorization, the read model's money handling, or the
+database security guards require human review before merge.
 
 ## Security
 
