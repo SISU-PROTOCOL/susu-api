@@ -9,7 +9,7 @@ We do not claim this software is secure, audited, or production-ready.
 
 Preparing for an independent review, the threats specific to this service — including the ones we
 believe are weakest, such as the API's database connection bypassing RLS — are written up in
-[`susu-contracts/docs/AUDIT_SCOPE.md`](https://github.com/SISU-PROTOCOL/susu-contracts/blob/main/docs/AUDIT_SCOPE.md).
+[`susu-contracts/docs/AUDIT_SCOPE.md`](https://github.com/susu-labs/susu-contracts/blob/main/docs/AUDIT_SCOPE.md).
 Read it before reporting something already known.
 
 ## Reporting a vulnerability
